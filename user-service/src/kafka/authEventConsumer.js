@@ -122,13 +122,10 @@ const handleEvent = async (event) => {
 const handleUserRegistered = async (event) => {
   try {
     const { authId, email, username, verificationToken } = event;
-    const { authId, email, username, verificationToken } = event;
 
     // Validate required fields
     if (!authId || !email || !username) {
-    if (!authId || !email || !username) {
       logger.error('USER_REGISTERED event missing required fields', { event });
-      throw new Error('Invalid event data: authId, email, and username are required');
       throw new Error('Invalid event data: authId, email, and username are required');
     }
 
@@ -139,7 +136,6 @@ const handleUserRegistered = async (event) => {
       throw new Error('Invalid email format');
     }
 
-    logger.info('Processing USER_REGISTERED event', { authId, email, username });
     logger.info('Processing USER_REGISTERED event', { authId, email, username });
 
     // Create user profile

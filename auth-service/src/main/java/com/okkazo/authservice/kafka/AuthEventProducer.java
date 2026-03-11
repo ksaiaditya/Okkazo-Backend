@@ -25,12 +25,10 @@ public class AuthEventProducer {
     private String topicName;
 
     public void userRegistered(UUID authId, String email, String username, String verificationToken){
-    public void userRegistered(UUID authId, String email, String username, String verificationToken){
         UserRegistrationEvent event = new UserRegistrationEvent(
                 "USER_REGISTERED",
                 authId,
                 email,
-                username,
                 username,
                 verificationToken
         );
