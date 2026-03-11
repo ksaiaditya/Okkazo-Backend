@@ -233,4 +233,18 @@ public class AuthService {
                 .newRole(Role.ADMIN.name())
                 .build();
     }
+
+    public CheckEmailExistsResponseDto checkEmailExists(String email) {
+        return repository.findByEmail(email)
+                .map(user -> new CheckEmailExistsResponseDto(
+                        true,
+                        user.getRole().name(),
+                        "Email exists"
+                ))
+                .orElse(new CheckEmailExistsResponseDto(
+                        false,
+                        null,
+                        "Email does not exist"
+                ));
+    }
 }

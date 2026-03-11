@@ -75,6 +75,17 @@ public class AuthController {
     }
     
     /**
+     * Check if an email exists in the system
+     * @param email The email address to check
+     * @return CheckEmailExistsResponseDto with exists flag, role, and message
+     */
+    @GetMapping("/check-email")
+    public ResponseEntity<CheckEmailExistsResponseDto> checkEmailExists(
+            @RequestParam("email") String email){
+        return ResponseEntity.ok(authService.checkEmailExists(email));
+    }
+    
+    /**
      * Register a new vendor with business details and documents
      * 
      * Valid Service Categories:

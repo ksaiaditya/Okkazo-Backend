@@ -1,6 +1,7 @@
 const adminEventProducer = require('../kafka/adminEventProducer');
 const logger = require('../utils/logger');
 const createApiError = require('../utils/ApiError');
+const axios = require('axios');
 
 const VALID_DEPARTMENTS = ['Public Event', 'Private Event', 'Core Operation'];
 const VALID_ROLES = ['Senior Event Manager', 'Junior Manager', 'Event Coordinator'];
@@ -35,6 +36,27 @@ const createManager = async (managerData, createdByAuthId) => {
     const allowedRoles = DEPARTMENT_ROLE_MAP[department];
     if (!allowedRoles.includes(assignedRole)) {
       throw createApiError(400, `Role '${assignedRole}' is not valid for department '${department}'. Allowed: ${allowedRoles.join(', ')}`);
+    }
+
+    // Check if email already exists in auth-service
+    const authServiceUrl = process.env.AUTH_SERVICE_URL || 'http://auth-service:8081';
+    try {
+      const emailCheckResponse = await axios.get(`${authServiceUrl}/check-email`, {
+        params: { email: managerData.email.trim().toLowerCase() },
+        timeout: 5000
+      });
+
+      if (emailCheckResponse.data.exists) {
+        throw createApiError(400, `Email already exists with role: ${emailCheckResponse.data.role}`);
+      }
+    } catch (error) {
+      // If it's our API error (email exists), rethrow it
+      if (error.statusCode === 400) {
+        throw error;
+      }
+      // Log other errors but don't block manager creation
+      logger.error('Error checking email existence:', error.message);
+      logger.warn('Proceeding with manager creation despite email check failure');
     }
 
     const eventData = {
