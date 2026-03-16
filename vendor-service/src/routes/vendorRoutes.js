@@ -4,9 +4,17 @@ const vendorController = require('../controllers/vendorController');
 const { extractUser } = require('../middleware/extractUser');
 const { authorizeRoles } = require('../middleware/authorization');
 const { upload } = require('../middleware/upload');
+const {
+  validateCreateVendorService,
+  validateUpdateVendorService,
+  validateServiceIdParam,
+} = require('../middleware/vendorValidation');
 
 // Public routes
 router.get('/health', vendorController.healthCheck);
+
+// Public service search (no auth required)
+router.get('/api/vendor/services/search', vendorController.searchVendorServices);
 
 // Protected routes - user context extracted from API Gateway headers
 router.use('/api/vendor', extractUser);
@@ -16,6 +24,31 @@ router.get('/api/vendor/me/application', vendorController.getMyApplication);
 
 // Get application status - accessible by the applicant
 router.get('/api/vendor/registration/status/:applicationId', vendorController.getApplicationStatus);
+
+// Vendor: save a new service
+router.post(
+  '/api/vendor/services',
+  validateCreateVendorService,
+  vendorController.createVendorService
+);
+
+// Vendor: get own services
+router.get('/api/vendor/services/me', vendorController.getMyServices);
+
+// Vendor: update a service
+router.patch(
+  '/api/vendor/services/:serviceId',
+  validateServiceIdParam,
+  validateUpdateVendorService,
+  vendorController.updateVendorService
+);
+
+// Vendor: delete a service
+router.delete(
+  '/api/vendor/services/:serviceId',
+  validateServiceIdParam,
+  vendorController.deleteVendorService
+);
 
 // Upload additional documents
 router.post(

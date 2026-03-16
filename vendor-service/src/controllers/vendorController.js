@@ -1,4 +1,5 @@
 const vendorService = require('../services/vendorService');
+const vendorServiceCatalog = require('../services/vendorServiceCatalog');
 const fileUploadService = require('../services/fileUploadService');
 const logger = require('../utils/logger');
 const { formatSuccessResponse, formatErrorResponse, generateDocumentId } = require('../utils/helpers');
@@ -476,6 +477,157 @@ const rejectDocument = async (req, res) => {
   }
 };
 
+/**
+ * Get the calling vendor's own services
+ * GET /api/vendor/services/me
+ */
+const getMyServices = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+
+    if (!authId) {
+      return res.status(401).json(
+        formatErrorResponse('UNAUTHORIZED', 'User not authenticated')
+      );
+    }
+
+    const result = await vendorServiceCatalog.getMyServices(authId, req.query);
+
+    res.status(200).json(formatSuccessResponse(result));
+  } catch (error) {
+    logger.error('Error in getMyServices:', error);
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse('INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
+ * Create / save a vendor service
+ * POST /api/vendor/services
+ */
+const createVendorService = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+
+    if (!authId) {
+      return res.status(401).json(
+        formatErrorResponse('UNAUTHORIZED', 'User not authenticated')
+      );
+    }
+
+    const service = await vendorServiceCatalog.createService(authId, req.body);
+
+    res.status(201).json(
+      formatSuccessResponse(service, 'Service created successfully')
+    );
+  } catch (error) {
+    logger.error('Error in createVendorService:', error);
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse(error.statusCode === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
+ * Search vendor services (public)
+ * GET /api/vendor/services/search
+ */
+const searchVendorServices = async (req, res) => {
+  try {
+    const result = await vendorServiceCatalog.searchServices(req.query);
+
+    res.status(200).json(formatSuccessResponse(result));
+  } catch (error) {
+    logger.error('Error in searchVendorServices:', error);
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse(error.statusCode === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
+ * Update a vendor service (owned by calling vendor)
+ * PATCH /api/vendor/services/:serviceId
+ */
+const updateVendorService = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+    const { serviceId } = req.params;
+
+    if (!authId) {
+      return res.status(401).json(
+        formatErrorResponse('UNAUTHORIZED', 'User not authenticated')
+      );
+    }
+
+    if (!serviceId || serviceId.trim() === '') {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'Service ID is required')
+      );
+    }
+
+    const updated = await vendorServiceCatalog.updateService(authId, serviceId, req.body);
+
+    res.status(200).json(
+      formatSuccessResponse(updated, 'Service updated successfully')
+    );
+  } catch (error) {
+    logger.error('Error in updateVendorService:', error);
+
+    if (error.statusCode === 404) {
+      return res.status(404).json(
+        formatErrorResponse('SERVICE_NOT_FOUND', error.message)
+      );
+    }
+
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse(error.statusCode === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
+ * Delete a vendor service (owned by calling vendor)
+ * DELETE /api/vendor/services/:serviceId
+ */
+const deleteVendorService = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+    const { serviceId } = req.params;
+
+    if (!authId) {
+      return res.status(401).json(
+        formatErrorResponse('UNAUTHORIZED', 'User not authenticated')
+      );
+    }
+
+    if (!serviceId || serviceId.trim() === '') {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'Service ID is required')
+      );
+    }
+
+    const result = await vendorServiceCatalog.deleteService(authId, serviceId);
+
+    res.status(200).json(
+      formatSuccessResponse(result, 'Service deleted successfully')
+    );
+  } catch (error) {
+    logger.error('Error in deleteVendorService:', error);
+
+    if (error.statusCode === 404) {
+      return res.status(404).json(
+        formatErrorResponse('SERVICE_NOT_FOUND', error.message)
+      );
+    }
+
+    res.status(error.statusCode || 500).json(
+      formatErrorResponse(error.statusCode === 400 ? 'VALIDATION_ERROR' : 'INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
 module.exports = {
   healthCheck,
   getApplicationStatus,
@@ -487,4 +639,9 @@ module.exports = {
   requestDocuments,
   verifyDocument,
   rejectDocument,
+  createVendorService,
+  searchVendorServices,
+  getMyServices,
+  updateVendorService,
+  deleteVendorService,
 };
