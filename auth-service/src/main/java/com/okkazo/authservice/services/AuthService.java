@@ -1,5 +1,6 @@
 package com.okkazo.authservice.services;
 
+import com.okkazo.authservice.dtos.CheckEmailExistsResponseDto;
 import com.okkazo.authservice.dtos.LoginRequestDto;
 import com.okkazo.authservice.dtos.LoginResponseDto;
 import com.okkazo.authservice.dtos.PromoteUserRequestDto;
