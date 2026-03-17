@@ -1,11 +1,11 @@
 const logger = require('../utils/logger');
-const ApiError = require('../utils/ApiError');
+const { createApiError } = require('../utils/ApiError');
 
 const authorizeRoles = (allowedRoles) => {
   return (req, res, next) => {
     try {
       if (!req.user) {
-        throw new ApiError(401, 'Authentication required');
+        throw createApiError(401, 'Authentication required');
       }
 
       const userRole = req.user.role;
@@ -17,7 +17,7 @@ const authorizeRoles = (allowedRoles) => {
           allowedRoles,
         });
 
-        throw new ApiError(403, 'Access denied. Insufficient permissions.');
+        throw createApiError(403, 'Access denied. Insufficient permissions.');
       }
 
       logger.debug('User authorized', {

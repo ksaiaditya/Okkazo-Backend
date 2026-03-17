@@ -1,6 +1,6 @@
 const adminEventProducer = require('../kafka/adminEventProducer');
 const logger = require('../utils/logger');
-const createApiError = require('../utils/ApiError');
+const { createApiError } = require('../utils/ApiError');
 const axios = require('axios');
 
 const VALID_DEPARTMENTS = ['Public Event', 'Private Event', 'Core Operation'];

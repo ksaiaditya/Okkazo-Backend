@@ -290,6 +290,65 @@ const sendManagerAccountCreatedEmail = async (email, passwordResetToken, name, d
   }
 };
 
+/**
+ * Send payment success email with event details
+ */
+const sendPaymentSuccessEmail = async (email, details) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventLocation,
+      eventStatus,
+      amount,
+      currency,
+      transactionId,
+      paidAt,
+    } = details || {};
+
+    if (!eventId) {
+      throw new Error('Event ID is required');
+    }
+
+    const template = await loadTemplate('payment-success');
+
+    const amountNumber = amount === null || amount === undefined ? null : Number(amount);
+    const amountRupees = Number.isFinite(amountNumber)
+      ? (amountNumber % 100 === 0 ? String(amountNumber / 100) : (amountNumber / 100).toFixed(2))
+      : null;
+
+    const currencyCode = (currency || 'INR').toString().toUpperCase();
+    const currencySymbol = currencyCode === 'INR' ? '₹' : '';
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle: eventTitle || 'Event',
+      eventLocation: eventLocation || 'TBA',
+      eventStatus: eventStatus || 'CONFIRMED',
+      amountRupees,
+      currency: currencyCode,
+      currencySymbol,
+      transactionId,
+      paidAt,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Payment Successful - ${eventTitle || eventId}`, html);
+
+    logger.info('Payment success email sent', { email, eventId, transactionId });
+  } catch (error) {
+    logger.error('Error sending payment success email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -300,4 +359,5 @@ module.exports = {
   sendTestEmail,
   sendVendorAccountCreatedEmail,
   sendManagerAccountCreatedEmail,
+  sendPaymentSuccessEmail,
 };

@@ -1,5 +1,5 @@
 const logger = require('../utils/logger');
-const ApiError = require('../utils/ApiError');
+const { createApiError } = require('../utils/ApiError');
 
 const errorHandler = (err, req, res, next) => {
   let error = err;
@@ -13,20 +13,20 @@ const errorHandler = (err, req, res, next) => {
 
   if (err.name === 'ValidationError') {
     const message = Object.values(err.errors).map((val) => val.message);
-    error = new ApiError(400, `Validation Error: ${message.join(', ')}`);
+    error = createApiError(400, `Validation Error: ${message.join(', ')}`);
   }
 
   if (err.code === 11000) {
     const field = Object.keys(err.keyPattern)[0];
-    error = new ApiError(409, `${field} already exists`);
+    error = createApiError(409, `${field} already exists`);
   }
 
   if (err.name === 'CastError') {
-    error = new ApiError(400, `Invalid ${err.path}: ${err.value}`);
+    error = createApiError(400, `Invalid ${err.path}: ${err.value}`);
   }
 
   if (err.name === 'JsonWebTokenError') {
-    error = new ApiError(401, 'Invalid token');
+    error = createApiError(401, 'Invalid token');
   }
 
   if (err.name === 'TokenExpiredError') {

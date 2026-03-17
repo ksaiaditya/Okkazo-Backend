@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Payment Confirmed — {{platformName}}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: #e8eaf0;
+      padding: 48px 16px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .shell { max-width: 580px; margin: 0 auto; }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 4px 20px;
+    }
+    .topbar-brand {
+      font-family: 'Playfair Display', serif;
+      font-size: 17px;
+      color: #1a1a2e;
+    }
+    .topbar-secure {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 500;
+      color: #888;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .card {
+      background: #ffffff;
+      border-radius: 20px;
+      overflow: hidden;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.06), 0 20px 48px rgba(0,0,0,0.08);
+    }
+
+    /* Hero */
+    .hero {
+      background: #0a0a14;
+      padding: 48px 48px 52px;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse 60% 80% at 90% 50%, rgba(99,102,241,0.18) 0%, transparent 60%),
+                  radial-gradient(ellipse 40% 60% at 10% 100%, rgba(16,185,129,0.08) 0%, transparent 50%);
+      pointer-events: none;
+    }
+    .hero-inner { position: relative; z-index: 1; }
+
+    .hero-eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 28px;
+    }
+    .check-circle {
+      width: 28px; height: 28px;
+      background: #10b981;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .check-circle svg {
+      width: 14px; height: 14px;
+      stroke: #fff; fill: none;
+      stroke-width: 2.5;
+      stroke-linecap: round; stroke-linejoin: round;
+    }
+    .hero-eyebrow-text {
+      font-size: 13px; font-weight: 600;
+      color: #10b981; letter-spacing: 0.06em; text-transform: uppercase;
+    }
+
+    .hero-amount-row {
+      display: flex; align-items: flex-start; gap: 8px; margin-bottom: 6px;
+    }
+    .hero-currency-symbol {
+      font-size: 28px; font-weight: 300; color: #6b7280; margin-top: 12px; line-height: 1;
+    }
+    .hero-amount {
+      font-family: 'Playfair Display', serif;
+      font-size: 72px; color: #f9fafb; line-height: 1; letter-spacing: -0.02em;
+    }
+    .hero-currency-code {
+      font-size: 16px; font-weight: 500; color: #6b7280; margin-top: 18px; letter-spacing: 0.06em;
+    }
+    .hero-sub { font-size: 13.5px; font-weight: 400; color: #6b7280; margin-top: 10px; }
+
+    .hero-divider {
+      height: 1px;
+      background: linear-gradient(to right, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.1) 50%, rgba(255,255,255,0.04) 100%);
+      margin: 28px 0 24px;
+    }
+
+    .hero-meta { display: flex; gap: 32px; }
+    .meta-label {
+      font-size: 10px; font-weight: 600; color: #4b5563;
+      letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 4px;
+    }
+    .meta-value { font-size: 13px; font-weight: 500; color: #d1d5db; }
+    .meta-value.mono {
+      font-family: 'Courier New', monospace; font-size: 11.5px; letter-spacing: 0.04em;
+    }
+
+    /* Body */
+    .greeting {
+      padding: 36px 48px 28px;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .greeting-name { font-size: 19px; font-weight: 600; color: #111827; margin-bottom: 8px; }
+    .greeting-name em {
+      font-style: normal;
+      font-family: 'Playfair Display', serif;
+      color: #6366f1;
+    }
+    .greeting-copy { font-size: 14px; color: #6b7280; line-height: 1.75; }
+
+    .details-section {
+      padding: 28px 48px;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    .section-label {
+      font-size: 10px; font-weight: 700; letter-spacing: 0.12em;
+      text-transform: uppercase; color: #9ca3af; margin-bottom: 16px;
+    }
+
+    .details-table {
+      width: 100%; border-collapse: collapse;
+      border-radius: 12px; overflow: hidden;
+      border: 1px solid #f3f4f6;
+    }
+    .details-table tr { border-bottom: 1px solid #f9fafb; }
+    .details-table tr:last-child { border-bottom: none; }
+    .details-table td { padding: 13px 18px; font-size: 13.5px; vertical-align: middle; }
+    .details-table td:first-child {
+      color: #9ca3af; font-weight: 400; width: 38%; background: #fafafa;
+    }
+    .details-table td:last-child { color: #111827; font-weight: 500; }
+
+    .mono-id {
+      font-family: 'Courier New', monospace; font-size: 11.5px; color: #6b7280;
+      letter-spacing: 0.04em; background: #f3f4f6; padding: 3px 7px; border-radius: 4px;
+    }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #ecfdf5; border: 1px solid #a7f3d0;
+      color: #059669; font-size: 12px; font-weight: 600;
+      padding: 4px 10px; border-radius: 100px;
+    }
+    .status-dot { width: 6px; height: 6px; background: #10b981; border-radius: 50%; }
+
+    .notice-wrap { padding: 0 48px 28px; }
+    .notice {
+      padding: 16px 20px; background: #fffbeb;
+      border: 1px solid #fde68a; border-radius: 10px;
+      display: flex; gap: 12px; align-items: flex-start;
+    }
+    .notice-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+    .notice-text { font-size: 12.5px; color: #92400e; line-height: 1.7; }
+    .notice-text a { color: #78350f; text-decoration: underline; text-underline-offset: 2px; }
+
+    .signoff { padding: 0 48px 36px; }
+    .signoff-copy { font-size: 14px; color: #6b7280; line-height: 1.75; margin-bottom: 16px; }
+    .signoff-name { font-family: 'Playfair Display', serif; font-size: 17px; color: #111827; }
+    .signoff-title { font-size: 11.5px; color: #9ca3af; font-weight: 500; letter-spacing: 0.04em; margin-top: 3px; }
+
+    /* Footer */
+    .footer {
+      background: #f9fafb;
+      border-top: 1px solid #f3f4f6;
+      padding: 24px 48px;
+    }
+    .footer-top {
+      display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;
+    }
+    .footer-brand { font-family: 'Playfair Display', serif; font-size: 14px; color: #374151; }
+    .footer-links { display: flex; gap: 16px; }
+    .footer-links a { font-size: 11.5px; color: #9ca3af; text-decoration: none; font-weight: 500; }
+    .footer-rule { height: 1px; background: #e5e7eb; margin-bottom: 16px; }
+    .footer-legal { font-size: 11px; color: #d1d5db; line-height: 1.8; text-align: center; }
+    .footer-legal a { color: #9ca3af; text-decoration: none; }
+
+    .bottom-label {
+      text-align: center; padding-top: 18px;
+      font-size: 11px; color: #9ca3af; letter-spacing: 0.04em;
+    }
+
+    @media (max-width: 480px) {
+      body { padding: 24px 12px; }
+      .hero { padding: 32px 24px 38px; }
+      .hero-amount { font-size: 52px; }
+      .hero-meta { flex-wrap: wrap; gap: 18px; }
+      .greeting, .details-section, .notice-wrap, .signoff, .footer { padding-left: 24px; padding-right: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+
+    <div class="topbar">
+      <div class="topbar-brand">{{platformName}}</div>
+      <div class="topbar-secure">
+        <svg width="10" height="13" viewBox="0 0 10 13" fill="none"><rect x="0.5" y="5.5" width="9" height="7" rx="1.5" stroke="#888" stroke-width="1.2"/><path d="M2.5 5.5V4a2.5 2.5 0 015 0v1.5" stroke="#888" stroke-width="1.2" stroke-linecap="round"/></svg>
+        Secure Receipt
+      </div>
+    </div>
+
+    <div class="card">
+
+      <!-- ── Hero ── -->
+      <div class="hero">
+        <div class="hero-inner">
+          <div class="hero-eyebrow">
+            <div class="check-circle">
+              <svg viewBox="0 0 14 14"><polyline points="2,7 5.5,10.5 12,4"/></svg>
+            </div>
+            <span class="hero-eyebrow-text">Payment Confirmed</span>
+          </div>
+
+          <div class="hero-amount-row">
+            <span class="hero-currency-symbol">{{currencySymbol}}</span>
+            <span class="hero-amount">{{amountRupees}}</span>
+            <span class="hero-currency-code">{{currency}}</span>
+          </div>
+          <div class="hero-sub">Charged to your account &nbsp;·&nbsp; {{paidAt}}</div>
+
+          <div class="hero-divider"></div>
+
+          <div class="hero-meta">
+            {{#if transactionId}}
+            <div class="meta-item">
+              <div class="meta-label">Transaction</div>
+              <div class="meta-value mono">{{transactionId}}</div>
+            </div>
+            {{/if}}
+            <div class="meta-item">
+              <div class="meta-label">Status</div>
+              <div class="meta-value">✓&ensp;Paid</div>
+            </div>
+            <div class="meta-item">
+              <div class="meta-label">Date</div>
+              <div class="meta-value">{{paidAt}}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Greeting ── -->
+      <div class="greeting">
+        <div class="greeting-name">Hello, <em>{{recipientName}}</em></div>
+        <p class="greeting-copy">
+          Your payment has been received and processed successfully. Your booking is now fully confirmed.
+          Please keep this receipt for your records.
+        </p>
+      </div>
+
+      <!-- ── Booking Summary ── -->
+      <div class="details-section">
+        <div class="section-label">Booking Summary</div>
+        <table class="details-table">
+          <tr>
+            <td>Event</td>
+            <td>{{eventTitle}}</td>
+          </tr>
+          <tr>
+            <td>Event ID</td>
+            <td><span class="mono-id">{{eventId}}</span></td>
+          </tr>
+          <tr>
+            <td>Location</td>
+            <td>{{eventLocation}}</td>
+          </tr>
+          <tr>
+            <td>Booking Status</td>
+            <td>
+              <span class="status-pill">
+                <span class="status-dot"></span>
+                {{eventStatus}}
+              </span>
+            </td>
+          </tr>
+          {{#if paidAt}}
+          <tr>
+            <td>Payment Date</td>
+            <td>{{paidAt}}</td>
+          </tr>
+          {{/if}}
+          {{#if amountRupees}}
+          <tr>
+            <td>Amount Paid</td>
+            <td style="font-weight:700;color:#111827;">{{currencySymbol}}{{amountRupees}} {{currency}}</td>
+          </tr>
+          {{/if}}
+        </table>
+      </div>
+
+      <!-- ── Security Notice ── -->
+      <div class="notice-wrap">
+        <div class="notice">
+          <span class="notice-icon">⚠</span>
+          <p class="notice-text">
+            <strong>Didn't authorise this payment?</strong> Contact our support team immediately at
+            <a href="mailto:{{supportEmail}}">{{supportEmail}}</a>. We'll investigate and respond within 24 hours.
+          </p>
+        </div>
+      </div>
+
+      <!-- ── Sign-off ── -->
+      <div class="signoff">
+        <p class="signoff-copy">
+          Thank you for your trust. We look forward to welcoming you to the event — if you have
+          any questions before then, our team is always here to help.
+        </p>
+        <div class="signoff-name">The {{platformName}} Team</div>
+        <div class="signoff-title">Customer Experience</div>
+      </div>
+
+      <!-- ── Footer ── -->
+      <div class="footer">
+        <div class="footer-top">
+          <div class="footer-brand">{{platformName}}</div>
+          <div class="footer-links">
+            <a href="#">Help Center</a>
+            <a href="#">Privacy</a>
+            <a href="#">Terms</a>
+            <a href="mailto:{{supportEmail}}">Support</a>
+          </div>
+        </div>
+        <div class="footer-rule"></div>
+        <p class="footer-legal">
+          This is an automated transactional email — please do not reply directly to this message.<br>
+          &copy; 2026 {{platformName}}. All rights reserved. &nbsp;·&nbsp;
+          <a href="#">Unsubscribe</a> &nbsp;·&nbsp; <a href="#">Privacy Policy</a>
+        </p>
+      </div>
+
+    </div>
+
+    <div class="bottom-label">Powered by {{platformName}} Payments &nbsp;·&nbsp; 256-bit SSL Encryption</div>
+  </div>
+</body>
+</html>
