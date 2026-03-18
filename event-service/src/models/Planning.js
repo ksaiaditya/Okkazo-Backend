@@ -212,6 +212,11 @@ const PlanningSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    platformFee: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
     fullPaymentPaid: {
       type: Boolean,
       default: false,

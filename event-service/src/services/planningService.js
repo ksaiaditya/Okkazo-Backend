@@ -4,11 +4,25 @@ const logger = require("../utils/logger");
 const createApiError = require("../utils/ApiError");
 const { STATUS } = require('../utils/planningConstants');
 const vendorSelectionService = require('./vendorSelectionService');
+const promoteConfigService = require('./promoteConfigService');
+
+const hydratePlanningFees = (planning, platformFeeFallback) => {
+  if (!planning) return planning;
+  if (planning.platformFee === undefined || planning.platformFee === null) {
+    return { ...planning, platformFee: platformFeeFallback };
+  }
+  return planning;
+};
 
 /**
  * Create a new planning event
  */
 const createPlanning = async (payload) => {
+  if (payload.platformFee === undefined || payload.platformFee === null) {
+    const cfg = await promoteConfigService.getFees();
+    payload.platformFee = cfg.platformFee;
+  }
+
   const planning = new Planning(payload);
   const saved = await planning.save();
 
@@ -35,17 +49,20 @@ const getPlanningsByAuthId = async (authId, page = 1, limit = 10) => {
 
   const skip = (page - 1) * limit;
 
-  const [plannings, total] = await Promise.all([
+  const [plannings, total, cfg] = await Promise.all([
     Planning.find({ authId: authId.trim() })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
       .lean(),
     Planning.countDocuments({ authId: authId.trim() }),
+    promoteConfigService.getFees(),
   ]);
 
+  const hydrated = (plannings || []).map((p) => hydratePlanningFees(p, cfg.platformFee));
+
   return {
-    plannings,
+    plannings: hydrated,
     pagination: {
       currentPage: Number(page),
       totalPages: Math.ceil(total / limit),
@@ -63,12 +80,15 @@ const getPlanningByEventId = async (eventId) => {
     throw createApiError(400, "Event ID is required");
   }
 
-  const planning = await Planning.findOne({ eventId: eventId.trim() }).lean();
+  const [planning, cfg] = await Promise.all([
+    Planning.findOne({ eventId: eventId.trim() }).lean(),
+    promoteConfigService.getFees(),
+  ]);
   if (!planning) {
     throw createApiError(404, "Planning not found");
   }
 
-  return planning;
+  return hydratePlanningFees(planning, cfg.platformFee);
 };
 
 /**
@@ -95,17 +115,20 @@ const getAllPlannings = async (filters = {}, page = 1, limit = 10) => {
 
   const skip = (page - 1) * limit;
 
-  const [plannings, total] = await Promise.all([
+  const [plannings, total, cfg] = await Promise.all([
     Planning.find(query)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
       .lean(),
     Planning.countDocuments(query),
+    promoteConfigService.getFees(),
   ]);
 
+  const hydrated = (plannings || []).map((p) => hydratePlanningFees(p, cfg.platformFee));
+
   return {
-    plannings,
+    plannings: hydrated,
     pagination: {
       currentPage: Number(page),
       totalPages: Math.ceil(total / limit),

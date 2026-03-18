@@ -178,11 +178,23 @@ const PromoteSchema = new mongoose.Schema(
     },
 
     // Payment
+    platformFee: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
     platformFeePaid: {
       type: Boolean,
       required: true,
       default: false,
       index: true,
+    },
+
+    serviceChargePercent: {
+      type: Number,
+      default: null,
+      min: 0,
+      max: 100,
     },
 
     // Revenue calculations (computed and stored on save)
@@ -248,7 +260,10 @@ const computeRevenue = (doc) => {
       (acc, tier) => acc + tier.price * tier.quantity,
       0
     );
-    const charge = total * SERVICE_CHARGE_RATE;
+    const fallbackPercent = SERVICE_CHARGE_RATE * 100;
+    const percent = Number.isFinite(doc.serviceChargePercent) ? doc.serviceChargePercent : fallbackPercent;
+    const rate = Math.max(0, Math.min(100, Number(percent))) / 100;
+    const charge = total * rate;
     return { totalAmount: total, serviceCharge: charge, estimatedNetRevenue: total - charge };
   }
   return { totalAmount: 0, serviceCharge: 0, estimatedNetRevenue: 0 };

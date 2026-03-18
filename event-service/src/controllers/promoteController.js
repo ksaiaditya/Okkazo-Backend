@@ -2,6 +2,7 @@ const promoteService = require('../services/promoteService');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
+const promoteConfigService = require('../services/promoteConfigService');
 
 // ─── Create a new promote record ──────────────────────────────────────────────
 /**
@@ -270,6 +271,28 @@ const deletePromote = async (req, res) => {
 
 module.exports = {
   createPromote,
+  getPlatformFee: async (req, res) => {
+    try {
+      const result = await promoteConfigService.getPlatformFee();
+      return res.status(200).json({ success: true, data: result });
+    } catch (error) {
+      logger.error('Error in getPlatformFee:', error);
+      return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+    }
+  },
+  updatePlatformFee: async (req, res) => {
+    try {
+      const { platformFee } = req.body;
+      const result = await promoteConfigService.updatePlatformFee({
+        platformFee,
+        updatedByAuthId: req.user?.authId || null,
+      });
+      return res.status(200).json({ success: true, message: 'Platform fee updated', data: result });
+    } catch (error) {
+      logger.error('Error in updatePlatformFee:', error);
+      return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+    }
+  },
   getMyPromotes,
   getPromoteByEventId,
   getAllPromotes,

@@ -3,6 +3,7 @@ const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 const axios = require('axios');
+const vendorReservationService = require('../services/vendorReservationService');
 
 const defaultVendorServiceUrl = process.env.SERVICE_HOST
   ? 'http://vendor-service:8084' // docker-compose service name
@@ -84,6 +85,9 @@ const fetchAllVendorsBasedOnService = async ({
   skip,
   businessName,
   enableGeo,
+  day,
+  from,
+  to,
 }) => {
   const params = {
     serviceCategory,
@@ -91,6 +95,10 @@ const fetchAllVendorsBasedOnService = async ({
     skip,
     ...(businessName ? { businessName } : {}),
   };
+
+  const hasAvailabilityRange =
+    (day != null && String(day).trim()) ||
+    ((from != null && String(from).trim()) && (to != null && String(to).trim()));
 
   // Only include geo params when explicitly enabled AND coordinates are valid.
   // This avoids unintentionally filtering out all vendors for distant events.
@@ -100,7 +108,15 @@ const fetchAllVendorsBasedOnService = async ({
     if (radiusKm != null) params.radiusKm = radiusKm;
   }
 
-  const response = await axios.get(`${vendorServiceUrl}/api/vendor/services/search`, {
+  if (day != null && String(day).trim()) params.day = String(day).trim();
+  if (from != null && String(from).trim()) params.from = String(from).trim();
+  if (to != null && String(to).trim()) params.to = String(to).trim();
+
+  const upstreamPath = hasAvailabilityRange
+    ? '/api/vendor/services/available'
+    : '/api/vendor/services/search';
+
+  const response = await axios.get(`${vendorServiceUrl}${upstreamPath}`, {
     timeout: upstreamTimeoutMs,
     params,
   });
@@ -489,6 +505,9 @@ const getVendorsForPlanning = async (req, res) => {
       limit,
       skip,
       q,
+      day,
+      from,
+      to,
     } = req.query;
 
     if (!eventId || !eventId.trim()) {
@@ -503,6 +522,16 @@ const getVendorsForPlanning = async (req, res) => {
     const lat1 = toNumber(planning?.location?.latitude, null);
     const lon1 = toNumber(planning?.location?.longitude, null);
 
+    // If caller doesn't provide a day/range, fall back to planning event date if present.
+    const planningDayFallback =
+      planning?.eventDate instanceof Date
+        ? planning.eventDate.toISOString().slice(0, 10)
+        : (planning?.schedule?.startAt instanceof Date ? planning.schedule.startAt.toISOString().slice(0, 10) : null);
+
+    const effectiveDay = (day && String(day).trim()) ? String(day).trim() : planningDayFallback;
+    const effectiveFrom = (from && String(from).trim()) ? String(from).trim() : null;
+    const effectiveTo = (to && String(to).trim()) ? String(to).trim() : null;
+
     const hasRadiusParam = Object.prototype.hasOwnProperty.call(req.query, 'radiusKm');
     const effectiveLimit = Math.min(toNumber(limit, 100), 100);
 
@@ -515,6 +544,9 @@ const getVendorsForPlanning = async (req, res) => {
       skip: toNumber(skip, 0),
       businessName: q ? String(q).trim() : null,
       enableGeo: hasRadiusParam && lat1 != null && lon1 != null,
+      day: effectiveDay,
+      from: effectiveFrom,
+      to: effectiveTo,
     });
 
     const minP = toNumber(priceMin, 0);
@@ -628,6 +660,19 @@ const getVendorsForPlanning = async (req, res) => {
       if (minP != null && max != null && max < minP) return false;
       return true;
     });
+
+    // Exclude vendors reserved by other events on the same day (prevents double-booking via selection)
+    if (effectiveDay) {
+      const reserved = await vendorReservationService.listReservedVendorAuthIdsForDay({
+        day: effectiveDay,
+        excludeEventId: eventId.trim(),
+      });
+
+      if (reserved.length > 0) {
+        const reservedSet = new Set(reserved);
+        items = items.filter((v) => !reservedSet.has(v.vendorAuthId));
+      }
+    }
 
     if (sortKey === 'nearest') {
       items = [...items].sort((a, b) => {

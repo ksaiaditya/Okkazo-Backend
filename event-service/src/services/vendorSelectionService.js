@@ -3,6 +3,7 @@ const VendorSelection = require('../models/VendorSelection');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { SERVICE_OPTIONS, VENDOR_STATUS } = require('../utils/vendorSelectionConstants');
+const vendorReservationService = require('./vendorReservationService');
 
 const normalizeServices = (selectedServices) => {
   if (!Array.isArray(selectedServices)) {
@@ -144,6 +145,8 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
 
   const selection = await ensureForPlanning(planning);
 
+  const planningDay = vendorReservationService.planningToDay(planning);
+
   const service = String(vendorUpdate?.service || '').trim();
   if (!service) throw createApiError(400, 'service is required');
   if (!SERVICE_OPTIONS.includes(service)) throw createApiError(400, 'Invalid service');
@@ -169,6 +172,27 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
 
   const vendors = Array.isArray(selection.vendors) ? selection.vendors : [];
   const idx = vendors.findIndex((v) => v.service === service);
+  const currentVendorAuthId =
+    idx >= 0
+      ? (vendors[idx]?.vendorAuthId != null && String(vendors[idx].vendorAuthId).trim() ? String(vendors[idx].vendorAuthId).trim() : null)
+      : null;
+
+  // Claim new reservation first (so we don't drop an existing valid selection on conflict)
+  let claimedReservation = false;
+  if (next.vendorAuthId && next.vendorAuthId !== currentVendorAuthId) {
+    if (!planningDay) {
+      throw createApiError(400, 'Event date is required before selecting vendors');
+    }
+
+    await vendorReservationService.claim({
+      vendorAuthId: next.vendorAuthId,
+      day: planningDay,
+      eventId: eventId.trim(),
+      authId: authId.trim(),
+      service,
+    });
+    claimedReservation = true;
+  }
 
   if (idx >= 0) {
     const current = vendors[idx]?.toObject ? vendors[idx].toObject() : vendors[idx];
@@ -188,7 +212,24 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
   }
 
   selection.vendors = vendors;
-  await selection.save();
+  try {
+    await selection.save();
+  } catch (e) {
+    // Roll back any newly-claimed reservation if selection save fails
+    if (claimedReservation && planningDay && next.vendorAuthId) {
+      vendorReservationService
+        .release({ vendorAuthId: next.vendorAuthId, day: planningDay, eventId: eventId.trim() })
+        .catch((rollbackErr) => logger.error('Failed to rollback vendor reservation after save error:', rollbackErr));
+    }
+    throw e;
+  }
+
+  // Release old reservation after successful save (best-effort)
+  if (planningDay && currentVendorAuthId && currentVendorAuthId !== next.vendorAuthId) {
+    vendorReservationService
+      .release({ vendorAuthId: currentVendorAuthId, day: planningDay, eventId: eventId.trim() })
+      .catch((e) => logger.error('Failed to release vendor reservation:', e));
+  }
 
   return selection.toObject();
 };

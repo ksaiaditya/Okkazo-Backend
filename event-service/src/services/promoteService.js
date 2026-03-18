@@ -2,6 +2,7 @@ const Promote = require('../models/Promote');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { PROMOTE_STATUS } = require('../utils/promoteConstants');
+const promoteConfigService = require('./promoteConfigService');
 
 // ─── Create ───────────────────────────────────────────────────────────────────
 
@@ -11,6 +12,22 @@ const { PROMOTE_STATUS } = require('../utils/promoteConstants');
  * by the controller BEFORE calling this function.
  */
 const createPromote = async (payload) => {
+  // Snapshot the current fees config onto the promote record
+  if (
+    payload.platformFee === undefined ||
+    payload.platformFee === null ||
+    payload.serviceChargePercent === undefined ||
+    payload.serviceChargePercent === null
+  ) {
+    const cfg = await promoteConfigService.getFees();
+    if (payload.platformFee === undefined || payload.platformFee === null) {
+      payload.platformFee = cfg.platformFee;
+    }
+    if (payload.serviceChargePercent === undefined || payload.serviceChargePercent === null) {
+      payload.serviceChargePercent = cfg.serviceChargePercent;
+    }
+  }
+
   const promote = new Promote(payload);
   const saved = await promote.save();
 
@@ -21,7 +38,10 @@ const createPromote = async (payload) => {
     eventCategory: saved.eventCategory,
     eventStatus: saved.eventStatus,
     platformFeePaid: saved.platformFeePaid,
+    platformFee: saved.platformFee,
+    serviceChargePercent: saved.serviceChargePercent,
     totalAmount: saved.totalAmount,
+    serviceCharge: saved.serviceCharge,
     estimatedNetRevenue: saved.estimatedNetRevenue,
     ticketAnalytics: saved.ticketAnalytics,
     schedule: saved.schedule,
@@ -35,17 +55,28 @@ const getMyPromotes = async (authId, page = 1, limit = 10) => {
 
   const skip = (page - 1) * limit;
 
-  const [promotes, total] = await Promise.all([
+  const [promotes, total, cfg] = await Promise.all([
     Promote.find({ authId: authId.trim() })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
       .lean(),
     Promote.countDocuments({ authId: authId.trim() }),
+    promoteConfigService.getFees(),
   ]);
 
+  const platformFeeFallback = cfg.platformFee;
+  const serviceChargePercentFallback = cfg.serviceChargePercent;
+  const hydratedPromotes = (promotes || []).map((p) => ({
+    ...p,
+    platformFee: (p.platformFee === undefined || p.platformFee === null) ? platformFeeFallback : p.platformFee,
+    serviceChargePercent: (p.serviceChargePercent === undefined || p.serviceChargePercent === null)
+      ? serviceChargePercentFallback
+      : p.serviceChargePercent,
+  }));
+
   return {
-    promotes,
+    promotes: hydratedPromotes,
     pagination: {
       currentPage: Number(page),
       totalPages: Math.ceil(total / limit),
@@ -60,10 +91,19 @@ const getMyPromotes = async (authId, page = 1, limit = 10) => {
 const getPromoteByEventId = async (eventId) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
 
-  const promote = await Promote.findOne({ eventId: eventId.trim() }).lean();
+  const [promote, cfg] = await Promise.all([
+    Promote.findOne({ eventId: eventId.trim() }).lean(),
+    promoteConfigService.getFees(),
+  ]);
   if (!promote) throw createApiError(404, 'Promote record not found');
 
-  return promote;
+  return {
+    ...promote,
+    platformFee: (promote.platformFee === undefined || promote.platformFee === null) ? cfg.platformFee : promote.platformFee,
+    serviceChargePercent: (promote.serviceChargePercent === undefined || promote.serviceChargePercent === null)
+      ? cfg.serviceChargePercent
+      : promote.serviceChargePercent,
+  };
 };
 
 // ─── Read all (admin / manager) ──────────────────────────────────────────────
@@ -85,17 +125,28 @@ const getAllPromotes = async (filters = {}, page = 1, limit = 10) => {
 
   const skip = (page - 1) * limit;
 
-  const [promotes, total] = await Promise.all([
+  const [promotes, total, cfg] = await Promise.all([
     Promote.find(query)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(Number(limit))
       .lean(),
     Promote.countDocuments(query),
+    promoteConfigService.getFees(),
   ]);
 
+  const platformFeeFallback = cfg.platformFee;
+  const serviceChargePercentFallback = cfg.serviceChargePercent;
+  const hydratedPromotes = (promotes || []).map((p) => ({
+    ...p,
+    platformFee: (p.platformFee === undefined || p.platformFee === null) ? platformFeeFallback : p.platformFee,
+    serviceChargePercent: (p.serviceChargePercent === undefined || p.serviceChargePercent === null)
+      ? serviceChargePercentFallback
+      : p.serviceChargePercent,
+  }));
+
   return {
-    promotes,
+    promotes: hydratedPromotes,
     pagination: {
       currentPage: Number(page),
       totalPages: Math.ceil(total / limit),

@@ -22,6 +22,20 @@ router.get(
   promoteController.getMyPromotes
 );
 
+// GET /promote/platform-fee — Get current platform fee (all authenticated users)
+router.get(
+  '/promote/platform-fee',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  promoteController.getPlatformFee
+);
+
+// PATCH /promote/platform-fee — Update platform fee (Admin only)
+router.patch(
+  '/promote/platform-fee',
+  isAdmin,
+  promoteController.updatePlatformFee
+);
+
 // GET /promote — Get all promotes (Admin/Manager only)
 router.get(
   '/promote',

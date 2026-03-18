@@ -18,6 +18,7 @@ const { extractUser } = require('./middleware/extractUser');
 const planningRoutes = require('./routes/planningRoutes');
 const promoteRoutes  = require('./routes/promoteRoutes');
 const vendorSelectionRoutes = require('./routes/vendorSelectionRoutes');
+const configRoutes = require('./routes/configRoutes');
 
 // Initialize Express app
 const app = express();
@@ -46,6 +47,7 @@ app.use(extractUser);
 app.use('/', planningRoutes);
 app.use('/', promoteRoutes);
 app.use('/', vendorSelectionRoutes);
+app.use('/', configRoutes);
 
 // 404 handler
 app.use(notFound);
