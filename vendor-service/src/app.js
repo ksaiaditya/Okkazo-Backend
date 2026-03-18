@@ -15,6 +15,7 @@ const { errorHandler, notFound } = require('./middleware/errorHandler');
 
 // Import routes
 const vendorRoutes = require('./routes/vendorRoutes');
+const availabilityRoutes = require('./routes/availabilityRoutes');
 
 // Initialize Express app
 const app = express();
@@ -38,6 +39,7 @@ app.get('/health', (req, res) => {
 
 // API Routes
 app.use('/', vendorRoutes);
+app.use('/', availabilityRoutes);
 
 // 404 handler
 app.use(notFound);
