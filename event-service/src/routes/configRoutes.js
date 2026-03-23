@@ -18,6 +18,20 @@ router.patch(
   configController.updateFees
 );
 
+// GET /config/promotions — all authenticated roles
+router.get(
+  '/config/promotions',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  configController.getPromotions
+);
+
+// PATCH /config/promotions — admin only
+router.patch(
+  '/config/promotions',
+  isAdmin,
+  configController.updatePromotions
+);
+
 // GET /config/manager-autoassign — admin only
 router.get(
   '/config/manager-autoassign',

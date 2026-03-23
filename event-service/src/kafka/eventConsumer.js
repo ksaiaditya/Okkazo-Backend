@@ -64,8 +64,27 @@ const startConsuming = async () => {
             } catch (err) {
               logger.error('Failed to process PROMOTE payment success:', err.message);
             }
+          } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
+            // ── Planning deposit confirmed ─────────────────────────────────
+            const planning = await planningService.markPlanningDepositPaid(payload.eventId);
+
+            try {
+              await publishEvent('PLANNING_DEPOSIT_PAYMENT_CONFIRMED', {
+                eventId: planning.eventId,
+                authId: planning.authId,
+                platformFeePaid: Boolean(planning.platformFeePaid) || Boolean(planning.isPaid),
+                depositPaid: Boolean(planning.depositPaid),
+                fullPaymentPaid: Boolean(planning.fullPaymentPaid),
+                paymentOrderId: payload.paymentOrderId,
+                razorpayOrderId: payload.razorpayOrderId,
+                razorpayPaymentId: payload.razorpayPaymentId,
+                paidAt: payload.paidAt,
+              });
+            } catch (publishError) {
+              logger.error('Failed to publish PLANNING_DEPOSIT_PAYMENT_CONFIRMED event:', publishError.message);
+            }
           } else {
-            // ── Planning payment confirmed (default) ─────────────────────────
+            // ── Planning payment confirmed (default: platform fee) ──────────
             const planning = await planningService.markPlanningPaid(payload.eventId);
 
             try {

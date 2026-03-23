@@ -2,7 +2,6 @@ const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 const {
   PROMOTE_EVENT_CATEGORIES,
-  PROMOTION_PACKAGES,
   PROMOTE_STATUS,
   PROMOTE_STATUS_VALUES,
   TICKET_STATUS,
@@ -178,10 +177,6 @@ const PromoteSchema = new mongoose.Schema(
     promotion: {
       type: [String],
       default: [],
-      validate: {
-        validator: (values) => values.every((v) => PROMOTION_PACKAGES.includes(v)),
-        message: 'Invalid promotion package provided',
-      },
     },
 
     // Authenticity proof images (uploaded by organizer)

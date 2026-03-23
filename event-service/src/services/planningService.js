@@ -9,6 +9,7 @@ const vendorSelectionService = require('./vendorSelectionService');
 const promoteConfigService = require('./promoteConfigService');
 const mongoose = require('mongoose');
 const { fetchUserById } = require('./userServiceClient');
+const { ensureEventChatSeeded } = require('./chatSeedService');
 
 const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
   [CATEGORY.PUBLIC]: 'Public Event',
@@ -252,6 +253,15 @@ const updatePlanningStatus = async (
   await planning.save();
   logger.info(`Planning status updated: ${eventId} -> ${status}`);
 
+  // Best-effort: seed event chat between user + assigned manager.
+  if (assignedManagerId) {
+    ensureEventChatSeeded({
+      eventId: planning.eventId,
+      userAuthId: planning.authId,
+      managerAuthId: assignedManagerId,
+    });
+  }
+
   // Keep VendorSelection manager sync consistent whenever assignedManagerId changes.
   // (VendorSelection may already exist even before IMMEDIATE_ACTION.)
   if (assignedManagerId != null) {
@@ -301,6 +311,13 @@ const assignPlanningManager = async (eventId, assignedManagerId) => {
   planning.assignedManagerId = assignedManagerId;
   await planning.save();
   logger.info(`Planning manager assigned: ${planning.eventId} -> ${assignedManagerId}`);
+
+  // Best-effort: seed event chat between user + assigned manager.
+  ensureEventChatSeeded({
+    eventId: planning.eventId,
+    userAuthId: planning.authId,
+    managerAuthId: assignedManagerId,
+  });
 
   // Ensure VendorSelection exists + sync managerId.
   try {
@@ -366,6 +383,13 @@ const tryAutoAssignPlanningManager = async (eventId, assignedManagerId) => {
       const planning = await Planning.findOne({ eventId: String(eventId).trim() });
       if (planning) {
         await vendorSelectionService.ensureForPlanning(planning);
+
+        // Best-effort: seed event chat between user + assigned manager.
+        ensureEventChatSeeded({
+          eventId: planning.eventId,
+          userAuthId: planning.authId,
+          managerAuthId: assignedManagerId,
+        });
       }
     } catch (err) {
       logger.error('Failed to sync VendorSelection after auto-assign', {
@@ -681,6 +705,28 @@ const markPlanningPaid = async (eventId) => {
 };
 
 /**
+ * Mark planning deposit as paid after verified deposit payment event.
+ */
+const markPlanningDepositPaid = async (eventId) => {
+  if (!eventId || eventId.trim() === '') {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: eventId.trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  if (!planning.depositPaid) {
+    planning.depositPaid = true;
+    await planning.save({ validateBeforeSave: false });
+    logger.info(`Planning deposit marked as paid: ${eventId}`);
+  }
+
+  return planning;
+};
+
+/**
  * Confirm a planning selection (Owner)
  * - Sets planning.status to PENDING_APPROVAL
  * - Ensures VendorSelection exists and snapshots selected vendors onto planning.selectedVendors
@@ -793,6 +839,7 @@ module.exports = {
   deletePlanning,
   getPlanningStats,
   markPlanningPaid,
+  markPlanningDepositPaid,
   confirmPlanning,
   getAdminDashboard,
   getPlanningsForManager,

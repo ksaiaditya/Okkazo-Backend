@@ -5,6 +5,41 @@ const logger = require('../utils/logger');
 const { SERVICE_OPTIONS, VENDOR_STATUS } = require('../utils/vendorSelectionConstants');
 const vendorReservationService = require('./vendorReservationService');
 
+const SERVICE_ALIASES = {
+  catering: 'Catering & Drinks',
+  'catering and drinks': 'Catering & Drinks',
+  'catering & drink': 'Catering & Drinks',
+};
+
+const canonicalizeService = (value) => {
+  const raw = value == null ? '' : String(value).trim();
+  if (!raw) return '';
+
+  // Exact match first
+  if (SERVICE_OPTIONS.includes(raw)) return raw;
+
+  const key = raw.toLowerCase();
+  const alias = SERVICE_ALIASES[key];
+  if (alias && SERVICE_OPTIONS.includes(alias)) return alias;
+
+  // Case-insensitive match against canonical list
+  const ci = SERVICE_OPTIONS.find((s) => String(s).toLowerCase() === key);
+  return ci || raw;
+};
+
+const sanitizeExistingSelectionServices = (services) => {
+  const list = Array.isArray(services) ? services : [];
+
+  const canonical = list
+    .map((s) => canonicalizeService(s))
+    .map((s) => (s == null ? '' : String(s).trim()))
+    .filter((s) => s.length > 0);
+
+  // Keep only valid canonical options.
+  const valid = canonical.filter((s) => SERVICE_OPTIONS.includes(s));
+  return Array.from(new Set(valid));
+};
+
 const normalizeVendorAuthId = (vendorAuthId) => {
   const v = String(vendorAuthId || '').trim();
   if (!v) throw createApiError(400, 'vendorAuthId is required');
@@ -76,11 +111,71 @@ const ensureForPlanning = async (planning) => {
     return selection;
   }
 
+  // Sanitize legacy/invalid service values on existing selections.
+  // This protects downstream workflows (alternatives search requires exact serviceCategory enum).
+  let selectionDirty = false;
+  const sanitized = sanitizeExistingSelectionServices(selection.selectedServices);
+  const nextServices = sanitized.length === 0 ? selectedServices : sanitized;
+
+  const currentServices = Array.isArray(selection.selectedServices) ? selection.selectedServices : [];
+  const sameServices =
+    currentServices.length === nextServices.length &&
+    currentServices.every((s, i) => String(s) === String(nextServices[i]));
+
+  if (!sameServices) {
+    selection.selectedServices = nextServices;
+    selectionDirty = true;
+  }
+
+  // Ensure vendors array has an entry for every selected service (and drop invalid ones)
+  const existingByService = new Map();
+  for (const v of selection.vendors || []) {
+    const key = canonicalizeService(v?.service);
+    if (!key) continue;
+    // Prefer an existing entry that already has a selected vendor
+    if (!existingByService.has(key)) {
+      existingByService.set(key, v);
+      continue;
+    }
+
+    const prev = existingByService.get(key);
+    const prevHasVendor = prev?.vendorAuthId != null && String(prev.vendorAuthId).trim();
+    const nextHasVendor = v?.vendorAuthId != null && String(v.vendorAuthId).trim();
+    if (!prevHasVendor && nextHasVendor) {
+      existingByService.set(key, v);
+    }
+  }
+  const nextVendors = (selection.selectedServices || []).map((service) => {
+    const existing = existingByService.get(service);
+    if (existing) {
+      const asObj = existing?.toObject ? existing.toObject() : existing;
+      return { ...(asObj || {}), service };
+    }
+    return {
+      service,
+      vendorAuthId: null,
+      status: VENDOR_STATUS.YET_TO_SELECT,
+      alternativeNeeded: false,
+      rejectionReason: null,
+      servicePrice: { min: 0, max: 0 },
+    };
+  });
+
+  const currentVendors = Array.isArray(selection.vendors) ? selection.vendors : [];
+  const sameVendorServices =
+    currentVendors.length === nextVendors.length &&
+    currentVendors.every((v, i) => String(v?.service || '') === String(nextVendors[i]?.service || ''));
+
+  if (!sameVendorServices) {
+    selection.vendors = nextVendors;
+    selectionDirty = true;
+  }
+
   // Link planning to selection if missing
   let planningChanged = false;
   if (!selection.planningId) {
     selection.planningId = planning._id;
-    await selection.save();
+    selectionDirty = true;
   }
   if (!planning.vendorSelectionId) {
     planningChanged = true;
@@ -91,12 +186,16 @@ const ensureForPlanning = async (planning) => {
   const currentManagerId = selection.managerId ? String(selection.managerId).trim() : null;
   if (currentManagerId !== nextManagerId) {
     selection.managerId = nextManagerId;
-    await selection.save();
+    selectionDirty = true;
   }
 
   // Keep selectedServices aligned to planning by default (but do not overwrite if selection was already customized)
   if (!Array.isArray(selection.selectedServices) || selection.selectedServices.length === 0) {
     selection.selectedServices = selectedServices;
+    selectionDirty = true;
+  }
+
+  if (selectionDirty) {
     await selection.save();
   }
 
@@ -190,8 +289,23 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     rejectionReason: vendorUpdate.rejectionReason != null && String(vendorUpdate.rejectionReason).trim() ? String(vendorUpdate.rejectionReason).trim() : null,
     alternativeNeeded: Boolean(vendorUpdate.alternativeNeeded),
     servicePrice: {
-      min: Number(vendorUpdate?.servicePrice?.min ?? 0),
-      max: Number(vendorUpdate?.servicePrice?.max ?? 0),
+      min: (() => {
+        const n = Number(vendorUpdate?.servicePrice?.min ?? 0);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      })(),
+      max: (() => {
+        const minIn = Number(vendorUpdate?.servicePrice?.min ?? 0);
+        const safeMin = Number.isFinite(minIn) && minIn > 0 ? minIn : 0;
+
+        const maxIn = Number(vendorUpdate?.servicePrice?.max ?? 0);
+        const safeMax = Number.isFinite(maxIn) && maxIn > 0 ? maxIn : 0;
+
+        if (safeMin > 0 && (safeMax <= 0 || safeMax === safeMin)) {
+          return Math.ceil(safeMin * 1.5);
+        }
+
+        return safeMax;
+      })(),
     },
   };
 
@@ -333,6 +447,13 @@ const respondForVendor = async ({ eventId, vendorAuthId, action, service, reject
     if (pending.length > 0) targetItems = pending;
   }
 
+  // Track status transitions so callers can avoid duplicate side-effects (chat/email sends).
+  // IMPORTANT: Only track items we are actually going to modify.
+  const beforeStatuses = targetItems.map((v) => ({
+    service: v?.service || null,
+    status: v?.status || null,
+  }));
+
   if (action !== 'accept' && action !== 'reject') {
     throw createApiError(400, 'Invalid action');
   }
@@ -356,16 +477,31 @@ const respondForVendor = async ({ eventId, vendorAuthId, action, service, reject
   selection.vendors = vendors;
   await selection.save();
 
+  const transitionedRejectedServices = action === 'reject'
+    ? beforeStatuses
+      .filter((b) => b?.status !== VENDOR_STATUS.REJECTED)
+      .map((b) => (b?.service != null ? String(b.service).trim() : ''))
+      .filter(Boolean)
+    : [];
+
+  const didTransitionToRejected = transitionedRejectedServices.length > 0;
+
   // After save, compute if vendor still accepted any service for this event
   const afterItems = (selection.vendors || []).filter(
     (v) => v?.vendorAuthId && String(v.vendorAuthId).trim() === vendor
   );
   const vendorAcceptedAnyServiceAfter = afterItems.some((v) => v?.status === VENDOR_STATUS.ACCEPTED);
 
-  return { selection: selection.toObject(), vendorAcceptedAnyServiceAfter };
+  return {
+    selection: selection.toObject(),
+    vendorAcceptedAnyServiceAfter,
+    didTransitionToRejected,
+    transitionedRejectedServices,
+  };
 };
 
 module.exports = {
+  canonicalizeService,
   ensureForPlanning,
   getByEventId,
   updateSelectedServices,

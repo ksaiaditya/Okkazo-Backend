@@ -7,6 +7,7 @@ const { STATUS: PLANNING_STATUS } = require('../utils/planningConstants');
 const promoteConfigService = require('./promoteConfigService');
 const mongoose = require('mongoose');
 const { fetchUserById, fetchActiveManagers } = require('./userServiceClient');
+const { ensureEventChatSeeded } = require('./chatSeedService');
 
 const normalizeId = (value) => String(value || '').trim();
 
@@ -487,6 +488,14 @@ const assignManagerWithMetadata = async (
 
   await promote.save();
   logger.info(`Manager ${managerId} assigned to promote ${eventId} (auto=${Boolean(autoAssigned)})`);
+
+  // Best-effort: seed event chat between user + assigned manager.
+  ensureEventChatSeeded({
+    eventId: promote.eventId,
+    userAuthId: promote.authId,
+    managerAuthId: managerId,
+  });
+
   return promote;
 };
 
@@ -529,6 +538,23 @@ const tryAutoAssignManager = async (
   // NOTE: updateOne() bypasses Mongoose validation hooks, so PromoteSchema.pre('validate')
   // will NOT recompute eventStatus. Keep DB consistent manually.
   if (updateResult?.modifiedCount === 1) {
+    // Best-effort: seed event chat between user + assigned manager.
+    try {
+      const promoteForChat = await Promote.findOne({ eventId: String(eventId).trim() })
+        .select('eventId authId assignedManagerId')
+        .lean();
+
+      if (promoteForChat?.eventId && promoteForChat?.authId && promoteForChat?.assignedManagerId) {
+        ensureEventChatSeeded({
+          eventId: promoteForChat.eventId,
+          userAuthId: promoteForChat.authId,
+          managerAuthId: promoteForChat.assignedManagerId,
+        });
+      }
+    } catch (error) {
+      logger.warn(`Failed to seed promote chat after auto-assign for ${String(eventId).trim()}: ${error.message}`);
+    }
+
     try {
       const promote = await Promote.findOne({ eventId: String(eventId).trim() }).select('platformFeePaid assignedManagerId eventStatus').lean();
       if (promote && ![PROMOTE_STATUS.LIVE, PROMOTE_STATUS.COMPLETE].includes(promote.eventStatus)) {

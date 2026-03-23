@@ -6,6 +6,7 @@ const {
   SERVICE_OPTIONS,
   PUBLIC_PROMOTION_OPTIONS,
 } = require('../utils/planningConstants');
+const promotionConfigService = require('../services/promotionConfigService');
 const logger = require('../utils/logger');
 
 const deriveEventField = (body) => {
@@ -124,7 +125,7 @@ const publicPlanningSchema = Joi.object({
       .default([]),
   }).required(),
   promotionType: Joi.array()
-    .items(Joi.string().valid(...PUBLIC_PROMOTION_OPTIONS))
+    .items(Joi.string())
     .default([]),
 });
 
@@ -134,7 +135,7 @@ const publicPlanningSchema = Joi.object({
  * For multipart/form-data requests, nested objects (location, schedule, etc.)
  * arrive as JSON strings and must be parsed before validation.
  */
-const validateCreatePlanning = (req, res, next) => {
+const validateCreatePlanning = async (req, res, next) => {
   // Parse JSON string fields that arrive via multipart/form-data
   parseJsonFields(req);
 
@@ -150,11 +151,29 @@ const validateCreatePlanning = (req, res, next) => {
 
   const { category } = req.body;
 
+  let allowedPromotionValues = null;
+  if (category === CATEGORY.PUBLIC) {
+    try {
+      const cfg = await promotionConfigService.getPromotions();
+      allowedPromotionValues = promotionConfigService.getAllowedActiveValues(cfg.publicPromotionOptions);
+    } catch (e) {
+      // Fallback so public planning does not break if config is unavailable.
+      allowedPromotionValues = Array.isArray(PUBLIC_PROMOTION_OPTIONS) ? PUBLIC_PROMOTION_OPTIONS : [];
+    }
+  }
+
   let schema;
   if (category === CATEGORY.PRIVATE) {
     schema = privatePlanningSchema;
   } else if (category === CATEGORY.PUBLIC) {
-    schema = publicPlanningSchema;
+    schema = publicPlanningSchema.keys({
+      promotionType: Joi.array()
+        .items(Joi.string().valid(...(allowedPromotionValues || [])))
+        .default([])
+        .messages({
+          'any.only': `promotionType items must be one of: ${(allowedPromotionValues || []).join(', ')}`,
+        }),
+    });
   } else {
     return res.status(400).json({
       success: false,

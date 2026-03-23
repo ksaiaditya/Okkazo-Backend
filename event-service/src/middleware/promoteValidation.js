@@ -1,5 +1,6 @@
 const Joi = require('joi');
 const { PROMOTE_EVENT_CATEGORIES, PROMOTION_PACKAGES } = require('../utils/promoteConstants');
+const promotionConfigService = require('../services/promotionConfigService');
 const logger = require('../utils/logger');
 
 const deriveEventField = (body) => {
@@ -117,13 +118,8 @@ const createPromoteSchema = Joi.object({
     }),
   }).required(),
 
-  // Promotions
-  promotion: Joi.array()
-    .items(Joi.string().valid(...PROMOTION_PACKAGES))
-    .default([])
-    .messages({
-      'any.only': `promotion items must be one of: ${PROMOTION_PACKAGES.join(', ')}`,
-    }),
+  // Promotions (validated dynamically in middleware)
+  promotion: Joi.array().items(Joi.string()).default([]),
 });
 
 // ─── JSON field list for multipart parsing ────────────────────────────────────
@@ -138,7 +134,7 @@ const JSON_FIELDS = [
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
-const validateCreatePromote = (req, res, next) => {
+const validateCreatePromote = async (req, res, next) => {
   // Parse JSON-string fields that come in via multipart/form-data
   for (const field of JSON_FIELDS) {
     if (typeof req.body[field] === 'string') {
@@ -158,7 +154,24 @@ const validateCreatePromote = (req, res, next) => {
   delete req.body.field;
   delete req.body.interests;
 
-  const { error, value } = createPromoteSchema.validate(req.body, {
+  let allowedPromotionValues;
+  try {
+    const cfg = await promotionConfigService.getPromotions();
+    allowedPromotionValues = promotionConfigService.getAllowedActiveValues(cfg.promotePackages);
+  } catch (e) {
+    allowedPromotionValues = Array.isArray(PROMOTION_PACKAGES) ? PROMOTION_PACKAGES : [];
+  }
+
+  const schema = createPromoteSchema.keys({
+    promotion: Joi.array()
+      .items(Joi.string().valid(...(allowedPromotionValues || [])))
+      .default([])
+      .messages({
+        'any.only': `promotion items must be one of: ${(allowedPromotionValues || []).join(', ')}`,
+      }),
+  });
+
+  const { error, value } = schema.validate(req.body, {
     abortEarly: false,
     stripUnknown: true,
   });

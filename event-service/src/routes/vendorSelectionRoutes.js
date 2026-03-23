@@ -40,6 +40,13 @@ router.get(
   vendorSelectionController.getOrCreateForPlanning
 );
 
+// GET /vendor-selection/:eventId/alternatives?service=... - List available alternative vendors for a service
+router.get(
+  '/vendor-selection/:eventId/alternatives',
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
+  vendorSelectionController.listAlternativesForService
+);
+
 // PATCH /vendor-selection/:eventId/services - Update selected services
 router.patch(
   '/vendor-selection/:eventId/services',

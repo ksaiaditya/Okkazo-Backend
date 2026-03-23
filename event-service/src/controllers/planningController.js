@@ -13,6 +13,8 @@ const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceU
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
 
 const toNumber = (value, fallback = null) => {
+  if (value == null) return fallback;
+  if (typeof value === 'string' && value.trim() === '') return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 };
@@ -751,6 +753,8 @@ const getVendorsForPlanning = async (req, res) => {
     const planning = await ensureAccessToPlanning({ eventId: eventId.trim(), user: req.user });
     const lat1 = toNumber(planning?.location?.latitude, null);
     const lon1 = toNumber(planning?.location?.longitude, null);
+    const normalizedServiceCategory = String(serviceCategory).trim();
+    const isVenueCategory = normalizedServiceCategory === 'Venue';
 
     // If caller doesn't provide a day/range, fall back to planning event date if present.
     const planningDayFallback =
@@ -763,17 +767,21 @@ const getVendorsForPlanning = async (req, res) => {
     const effectiveTo = (to && String(to).trim()) ? String(to).trim() : null;
 
     const hasRadiusParam = Object.prototype.hasOwnProperty.call(req.query, 'radiusKm');
+    const rawRadiusKm = hasRadiusParam ? toNumber(radiusKm, 50) : null;
+    const effectiveRadiusKm = rawRadiusKm != null && rawRadiusKm > 0 ? rawRadiusKm : (hasRadiusParam ? 50 : null);
     const effectiveLimit = Math.min(toNumber(limit, 100), 100);
 
     const vendorServices = await fetchAllVendorsBasedOnService({
-      serviceCategory: String(serviceCategory).trim(),
+      serviceCategory: normalizedServiceCategory,
       latitude: lat1,
       longitude: lon1,
-      radiusKm: hasRadiusParam ? toNumber(radiusKm, 50) : null,
+      radiusKm: effectiveRadiusKm,
       limit: effectiveLimit,
       skip: toNumber(skip, 0),
       businessName: q ? String(q).trim() : null,
-      enableGeo: hasRadiusParam && lat1 != null && lon1 != null,
+      // Venue uses per-service coordinates (a vendor can have multiple venues across cities),
+      // so we do NOT geo-filter upstream. We'll filter in this controller.
+      enableGeo: !isVenueCategory && hasRadiusParam && lat1 != null && lon1 != null,
       day: effectiveDay,
       from: effectiveFrom,
       to: effectiveTo,
@@ -783,7 +791,7 @@ const getVendorsForPlanning = async (req, res) => {
     const maxP = toNumber(priceMax, null);
     const sortKey = normalizeSortKey(sort);
 
-    const serviceItems = vendorServices
+    let serviceItems = vendorServices
       .map((s) => {
         return {
           serviceId: s?._id,
@@ -810,6 +818,17 @@ const getVendorsForPlanning = async (req, res) => {
         return true;
       });
 
+    // Venue-only geo filter: use the venue listing coordinates stored on the service.
+    if (isVenueCategory && hasRadiusParam && lat1 != null && lon1 != null && effectiveRadiusKm != null) {
+      serviceItems = serviceItems.filter((s) => {
+        const sLat = toNumber(s?.details?.locationLat, toNumber(s?.details?.lat, null));
+        const sLon = toNumber(s?.details?.locationLng, toNumber(s?.details?.lng, null));
+        if (sLat == null || sLon == null) return false;
+        const d = haversineKm({ lat1, lon1, lat2: sLat, lon2: sLon });
+        return d <= effectiveRadiusKm;
+      });
+    }
+
     const authIds = Array.from(
       new Set(serviceItems.map((s) => s.vendorAuthId).filter(Boolean))
     );
@@ -830,13 +849,43 @@ const getVendorsForPlanning = async (req, res) => {
 
         const app = vendorAppByAuthId.get(authId) || null;
 
-        const vLat = toNumber(app?.latitude, toNumber(services?.[0]?.latitude, null));
-        const vLon = toNumber(app?.longitude, toNumber(services?.[0]?.longitude, null));
-
-        const distanceKm =
+        // Default: vendor HQ coordinates (from vendor app), with service fallback.
+        // Venue special-case: distance should be computed from the venue service's own location.
+        let vLat = toNumber(app?.latitude, toNumber(services?.[0]?.latitude, null));
+        let vLon = toNumber(app?.longitude, toNumber(services?.[0]?.longitude, null));
+        let distanceKm =
           lat1 != null && lon1 != null && vLat != null && vLon != null
             ? haversineKm({ lat1, lon1, lat2: vLat, lon2: vLon })
             : null;
+
+        if (isVenueCategory && lat1 != null && lon1 != null) {
+          const venueCandidates = services
+            .map((s) => {
+              const sLat = toNumber(s?.details?.locationLat, toNumber(s?.details?.lat, null));
+              const sLon = toNumber(s?.details?.locationLng, toNumber(s?.details?.lng, null));
+              if (sLat == null || sLon == null) return null;
+              const d = haversineKm({ lat1, lon1, lat2: sLat, lon2: sLon });
+              return {
+                lat: sLat,
+                lon: sLon,
+                distanceKm: d,
+                locationName: s?.details?.locationAreaName || null,
+              };
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.distanceKm - b.distanceKm);
+
+          if (venueCandidates.length > 0) {
+            vLat = venueCandidates[0].lat;
+            vLon = venueCandidates[0].lon;
+            distanceKm = venueCandidates[0].distanceKm;
+
+            // Prefer the specific venue area name when available.
+            if (app) {
+              app.location = venueCandidates[0].locationName || app.location;
+            }
+          }
+        }
 
         const prices = services.map((s) => toNumber(s.price, null)).filter((p) => p != null);
         const priceMin = prices.length ? Math.min(...prices) : null;
@@ -852,7 +901,7 @@ const getVendorsForPlanning = async (req, res) => {
         return {
           vendorAuthId: authId,
           businessName: app?.businessName || services?.[0]?.businessName || null,
-          serviceCategory: String(serviceCategory).trim(),
+          serviceCategory: normalizedServiceCategory,
           categoryId: services?.[0]?.categoryId || null,
           rating,
           location: {
@@ -933,7 +982,7 @@ const getVendorsForPlanning = async (req, res) => {
     return res.status(200).json({
       success: true,
       data: {
-        serviceCategory: String(serviceCategory).trim(),
+        serviceCategory: normalizedServiceCategory,
         vendors: items,
       },
     });

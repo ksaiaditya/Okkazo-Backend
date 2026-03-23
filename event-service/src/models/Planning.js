@@ -5,7 +5,6 @@ const {
   PRIVATE_EVENT_TYPES,
   PUBLIC_EVENT_TYPES,
   SERVICE_OPTIONS,
-  PUBLIC_PROMOTION_OPTIONS,
   STATUS,
   STATUS_VALUES,
 } = require('../utils/planningConstants');
@@ -181,10 +180,6 @@ const PlanningSchema = new mongoose.Schema(
     promotionType: {
       type: [String],
       default: [],
-      validate: {
-        validator: (values) => values.every((value) => PUBLIC_PROMOTION_OPTIONS.includes(value)),
-        message: 'Invalid promotion type provided',
-      },
     },
 
     selectedServices: {
