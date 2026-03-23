@@ -349,6 +349,49 @@ const sendPaymentSuccessEmail = async (email, details) => {
   }
 };
 
+/**
+ * Send email to client when a vendor rejects and alternatives are available.
+ */
+const sendVendorRejectedAlternativesEmail = async (email, details) => {
+  try {
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      serviceLabel,
+      rejectionReason,
+      options,
+    } = details || {};
+
+    if (!email || !eventId || !serviceLabel) {
+      throw new Error('email, eventId, and serviceLabel are required');
+    }
+
+    const template = await loadTemplate('vendor-rejected-alternatives');
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle: eventTitle || 'Event',
+      eventDate: eventDate || null,
+      eventLocation: eventLocation || 'TBA',
+      serviceLabel,
+      rejectionReason: rejectionReason || null,
+      options: Array.isArray(options) ? options : [],
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Vendor unavailable for ${serviceLabel} - Choose an alternative`, html);
+    logger.info('Vendor rejected alternatives email sent', { email, eventId, serviceLabel });
+  } catch (error) {
+    logger.error('Error sending vendor rejected alternatives email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -360,4 +403,5 @@ module.exports = {
   sendVendorAccountCreatedEmail,
   sendManagerAccountCreatedEmail,
   sendPaymentSuccessEmail,
+  sendVendorRejectedAlternativesEmail,
 };

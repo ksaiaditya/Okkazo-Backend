@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Choose an Alternative Vendor</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
+    <div style="max-width: 700px; margin: 0 auto; background-color: #ffffff; padding: 28px; border-radius: 10px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
+      <h2 style="margin: 0 0 12px 0; color: #111827;">Vendor not available — please choose an alternative</h2>
+      <p style="margin: 0 0 14px 0; color: #374151; font-size: 14px; line-height: 1.6;">
+        Hi {{recipientName}},
+      </p>
+
+      <p style="margin: 0 0 14px 0; color: #374151; font-size: 14px; line-height: 1.6;">
+        Your vendor request for <strong>{{serviceLabel}}</strong> in <strong>{{eventTitle}}</strong> could not be fulfilled.
+        Please choose one of the alternatives below.
+      </p>
+
+      {{#if rejectionReason}}
+        <div style="margin: 14px 0; padding: 12px; background: #fef3c7; border: 1px solid #fde68a; border-radius: 8px;">
+          <div style="font-size: 12px; color: #92400e; font-weight: bold; margin-bottom: 6px;">Vendor note</div>
+          <div style="font-size: 13px; color: #78350f; line-height: 1.5;">{{rejectionReason}}</div>
+        </div>
+      {{/if}}
+
+      <div style="margin-top: 18px;">
+        <div style="font-size: 13px; color: #6b7280; margin-bottom: 8px;">
+          Event ID: {{eventId}}
+          {{#if eventDate}} • Date: {{eventDate}}{{/if}}
+          {{#if eventLocation}} • Location: {{eventLocation}}{{/if}}
+        </div>
+
+        {{#if radiusKm}}
+          <div style="font-size: 13px; color: #6b7280; margin-bottom: 10px;">
+            These alternatives are within {{radiusKm}} km of the event location.
+          </div>
+        {{/if}}
+
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr>
+              <th style="text-align: left; padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">Vendor</th>
+              <th style="text-align: left; padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">Tier</th>
+              <th style="text-align: left; padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">Price Range</th>
+              <th style="text-align: left; padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">Location</th>
+              <th style="text-align: left; padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">Distance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {{#each options}}
+              <tr>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 14px; color: #111827; font-weight: bold;">{{businessName}}</td>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{#if tier}}{{tier}}{{else}}—{{/if}}</td>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{priceRange}}</td>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{#if location}}{{location}}{{else}}—{{/if}}{{#if country}}, {{country}}{{/if}}</td>
+                <td style="padding: 10px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #374151;">{{#if distanceText}}{{distanceText}}{{else}}—{{/if}}</td>
+              </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </div>
+
+      <p style="margin-top: 18px; color: #6b7280; font-size: 12px; line-height: 1.6;">
+        You can also review these options in your event chat inside {{platformName}}.
+      </p>
+
+      <p style="margin-top: 18px; color: #9ca3af; font-size: 12px;">
+        Need help? Contact us at {{supportEmail}}.
+      </p>
+    </div>
+  </body>
+</html>

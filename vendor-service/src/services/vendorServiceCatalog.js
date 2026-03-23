@@ -490,12 +490,15 @@ const searchServices = async (filters = {}) => {
 
     const query = { status: 'Active' };
 
+    const normalizedCategory = String(serviceCategory || '').trim();
+    const isVenueCategory = normalizedCategory === 'Venue';
+
     if (businessName && businessName.trim()) {
       query.businessName = { $regex: businessName.trim(), $options: 'i' };
     }
 
-    if (serviceCategory && serviceCategory.trim()) {
-      query.serviceCategory = serviceCategory.trim();
+    if (normalizedCategory) {
+      query.serviceCategory = normalizedCategory;
     }
 
     if (latitude !== undefined && longitude !== undefined) {
@@ -510,8 +513,23 @@ const searchServices = async (filters = {}) => {
       const latDelta = radius / 111;
       const lngDelta = radius / (111 * Math.cos((lat * Math.PI) / 180));
 
-      query.latitude = { $gte: lat - latDelta, $lte: lat + latDelta };
-      query.longitude = { $gte: lng - lngDelta, $lte: lng + lngDelta };
+      // Venue vendors can have multiple venue locations across cities.
+      // For Venue only, filter using the venue location coordinates stored on the service.
+      if (isVenueCategory) {
+        query.$or = [
+          {
+            'details.locationLat': { $gte: lat - latDelta, $lte: lat + latDelta },
+            'details.locationLng': { $gte: lng - lngDelta, $lte: lng + lngDelta },
+          },
+          {
+            'details.lat': { $gte: lat - latDelta, $lte: lat + latDelta },
+            'details.lng': { $gte: lng - lngDelta, $lte: lng + lngDelta },
+          },
+        ];
+      } else {
+        query.latitude = { $gte: lat - latDelta, $lte: lat + latDelta };
+        query.longitude = { $gte: lng - lngDelta, $lte: lng + lngDelta };
+      }
     }
 
     const parsedLimit = Math.min(parseInt(limit, 10) || 20, 100);
@@ -559,6 +577,63 @@ const getPublicVendorsByAuthIds = async (authIds) => {
 };
 
 /**
+ * Public vendor profile search (sanitized).
+ * Only APPROVED vendors.
+ */
+const searchPublicVendors = async (filters = {}) => {
+  const {
+    businessName,
+    serviceCategory,
+    latitude,
+    longitude,
+    radiusKm = 50,
+    limit = 20,
+    skip = 0,
+  } = filters;
+
+  const query = { status: 'APPROVED' };
+
+  if (businessName && String(businessName).trim()) {
+    query.businessName = { $regex: String(businessName).trim(), $options: 'i' };
+  }
+
+  if (serviceCategory && String(serviceCategory).trim()) {
+    query.serviceCategory = String(serviceCategory).trim();
+  }
+
+  if (latitude !== undefined && longitude !== undefined) {
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    const radius = parseFloat(radiusKm);
+
+    if (isNaN(lat) || isNaN(lng)) {
+      throw new ApiError(400, 'latitude and longitude must be valid numbers');
+    }
+
+    const latDelta = radius / 111;
+    const lngDelta = radius / (111 * Math.cos((lat * Math.PI) / 180));
+
+    query.latitude = { $gte: lat - latDelta, $lte: lat + latDelta };
+    query.longitude = { $gte: lng - lngDelta, $lte: lng + lngDelta };
+  }
+
+  const parsedLimit = Math.min(parseInt(limit, 10) || 20, 100);
+  const parsedSkip = parseInt(skip, 10) || 0;
+
+  const [vendors, total] = await Promise.all([
+    VendorApplication.find(query)
+      .sort({ createdAt: -1 })
+      .skip(parsedSkip)
+      .limit(parsedLimit)
+      .select('authId businessName serviceCategory images location place country latitude longitude description status')
+      .lean(),
+    VendorApplication.countDocuments(query),
+  ]);
+
+  return { vendors, total, limit: parsedLimit, skip: parsedSkip };
+};
+
+/**
  * Public service lookup by id (sanitized).
  * Only returns Active services.
  */
@@ -588,6 +663,7 @@ module.exports = {
   getMyServices,
   searchServices,
   getPublicVendorsByAuthIds,
+  searchPublicVendors,
   getPublicServiceById,
   updateService,
   deleteService,

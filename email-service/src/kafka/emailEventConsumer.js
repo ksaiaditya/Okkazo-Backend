@@ -9,6 +9,7 @@ let consumer = null;
 // Topics
 const authTopic = process.env.KAFKA_AUTH_TOPIC || process.env.KAFKA_TOPIC || 'auth_events';
 const paymentTopic = process.env.KAFKA_PAYMENT_TOPIC || 'payment_events';
+const eventTopic = process.env.KAFKA_EVENT_TOPIC || 'event_events';
 
 // Upstream service URLs (Docker defaults)
 const userServiceUrl = process.env.USER_SERVICE_URL || 'http://user-service:8082';
@@ -19,11 +20,23 @@ const httpTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 
 const dedupeTtlMs = parseInt(process.env.PAYMENT_EMAIL_DEDUPE_TTL_MS || '3600000', 10);
 const sentPaymentEmails = new Map();
 
+const alternativesDedupeTtlMs = parseInt(process.env.ALTERNATIVES_EMAIL_DEDUPE_TTL_MS || '3600000', 10);
+const sentAlternativesEmails = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
     if (now - ts > dedupeTtlMs) {
       sentPaymentEmails.delete(key);
+    }
+  }
+};
+
+const pruneAlternativesSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentAlternativesEmails.entries()) {
+    if (now - ts > alternativesDedupeTtlMs) {
+      sentAlternativesEmails.delete(key);
     }
   }
 };
@@ -44,7 +57,11 @@ const initialize = async () => {
         await consumer.subscribe({ topic: paymentTopic, fromBeginning: false });
       }
 
-      logger.info('Subscribed to Kafka topics', { authTopic, paymentTopic });
+      if (eventTopic && eventTopic !== authTopic && eventTopic !== paymentTopic) {
+        await consumer.subscribe({ topic: eventTopic, fromBeginning: false });
+      }
+
+      logger.info('Subscribed to Kafka topics', { authTopic, paymentTopic, eventTopic });
       return;
     } catch (error) {
       logger.error(`Error initializing Kafka consumer (attempt ${attempt}/${maxRetries}):`, error.message);
@@ -57,12 +74,103 @@ const initialize = async () => {
   }
 };
 
-const fetchUserByAuthId = async (authId) => {
-  const response = await axios.get(`${userServiceUrl}/auth/${encodeURIComponent(authId)}`, {
-    timeout: httpTimeoutMs,
+const formatMoneyRangeFromBasePrice = (basePrice) => {
+  const p = basePrice == null ? null : Number(basePrice);
+  if (!Number.isFinite(p) || p <= 0) return '—';
+  const min = Math.round(p);
+  const max = Math.ceil(min * 1.5);
+  return `₹${min.toLocaleString()} - ₹${max.toLocaleString()}`;
+};
+
+const formatDistance = (km) => {
+  const n = km == null ? null : Number(km);
+  if (!Number.isFinite(n)) return '—';
+  if (n < 1) return `${Math.round(n * 1000)} m`;
+  return `${n.toFixed(1)} km`;
+};
+
+const handleVendorRequestRejectedAlternatives = async (event) => {
+  const { eventId, authId, service, rejectionReason, options, radiusKm } = event || {};
+
+  if (!eventId || !authId || !service) {
+    logger.error('VENDOR_REQUEST_REJECTED_ALTERNATIVES missing required fields', { event });
+    return;
+  }
+
+  const opts = Array.isArray(options) ? options : [];
+  if (opts.length === 0) {
+    logger.info('No alternatives in VENDOR_REQUEST_REJECTED_ALTERNATIVES; skipping email', { eventId, authId, service });
+    return;
+  }
+
+  // Dedupe (Kafka retries / replays)
+  const dedupeKey = `${String(eventId)}:${String(service)}`;
+  pruneAlternativesSentCache();
+  const existingTs = sentAlternativesEmails.get(dedupeKey);
+  if (existingTs && Date.now() - existingTs < alternativesDedupeTtlMs) {
+    logger.info('Skipping duplicate alternatives email', { eventId, authId, service, dedupeKey });
+    return;
+  }
+
+  const user = await fetchUserByAuthId(authId);
+  const recipientEmail = user?.email;
+  if (!recipientEmail) {
+    logger.error('Unable to send alternatives email: user email not found', { authId, eventId });
+    return;
+  }
+
+  let planning = null;
+  try {
+    planning = await fetchPlanningByEventIdForUser(eventId, user);
+  } catch (e) {
+    logger.warn('Failed to fetch planning for alternatives email (non-blocking)', { eventId, authId, message: e?.message || String(e) });
+  }
+
+  const safeEventTitle = planning?.eventTitle || planning?.eventName || 'Event';
+  const safeEventDate = planning?.eventDate || planning?.schedule?.startAt || null;
+  const safeLocation = planning?.location?.name || planning?.location?.location || null;
+
+  const topOptions = opts.slice(0, 8).map((o) => ({
+    businessName: o?.businessName || 'Vendor',
+    tier: o?.tier || null,
+    serviceCategory: o?.serviceCategory || service,
+    location: o?.location || safeLocation || null,
+    country: o?.country || null,
+    priceRange: formatMoneyRangeFromBasePrice(o?.price),
+    distanceText: o?.distanceText || formatDistance(o?.distanceKm),
+  }));
+
+  await emailService.sendVendorRejectedAlternativesEmail(recipientEmail, {
+    recipientName: user?.name || user?.username || 'there',
+    eventId,
+    eventTitle: safeEventTitle,
+    eventDate: safeEventDate,
+    eventLocation: safeLocation,
+    serviceLabel: service,
+    rejectionReason: rejectionReason || null,
+    radiusKm: Number.isFinite(Number(radiusKm)) ? Number(radiusKm) : null,
+    options: topOptions,
   });
 
-  return response.data?.data;
+  sentAlternativesEmails.set(dedupeKey, Date.now());
+};
+
+const fetchUserByAuthId = async (authId) => {
+  try {
+    const response = await axios.get(`${userServiceUrl}/auth/${encodeURIComponent(authId)}`, {
+      timeout: httpTimeoutMs,
+    });
+
+    return response.data?.data;
+  } catch (e) {
+    const status = e?.response?.status;
+    logger.warn('Failed to fetch user from user-service', {
+      authId,
+      status,
+      message: e?.message || String(e),
+    });
+    return null;
+  }
 };
 
 const fetchPlanningByEventIdForUser = async (eventId, user) => {
@@ -190,6 +298,11 @@ const handleEvent = async (eventType, payload, topic) => {
         await handlePaymentSuccessEvent(payload);
       }
       break;
+    case 'VENDOR_REQUEST_REJECTED_ALTERNATIVES':
+      if (topic === eventTopic) {
+        await handleVendorRequestRejectedAlternatives(payload);
+      }
+      break;
     // Payment events that are useful for audit/analytics but do not trigger emails here
     case 'PAYMENT_ORDER_CREATED':
     case 'PAYMENT_TRANSACTION_UPDATED':
@@ -225,7 +338,13 @@ const startConsuming = async () => {
 
         await handleEvent(eventType, payload, topic);
       } catch (error) {
-        logger.error('Error processing Kafka message:', error);
+        logger.error('Error processing Kafka message', {
+          topic,
+          partition,
+          offset: message?.offset,
+          message: error?.message || String(error),
+          stack: error?.stack,
+        });
       }
     },
   });

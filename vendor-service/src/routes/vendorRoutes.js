@@ -19,6 +19,9 @@ router.get('/api/vendor/services/search', vendorController.searchVendorServices)
 // Public vendor profiles (sanitized, no auth required)
 router.get('/api/vendor/public/vendors', vendorController.getPublicVendors);
 
+// Public vendor profile search (sanitized, no auth required)
+router.get('/api/vendor/public/vendors/search', vendorController.searchPublicVendors);
+
 // Public service lookup (sanitized, no auth required)
 router.get('/api/vendor/public/services/:serviceId', vendorController.getPublicServiceById);
 

@@ -1,4 +1,5 @@
 const paymentService = require('../services/paymentService');
+const paymentSettingsService = require('../services/paymentSettingsService');
 
 const createOrder = async (req, res) => {
   const result = await paymentService.createOrder(req.body, req.user);
@@ -59,6 +60,25 @@ const getOrdersByEventIdForAdmin = async (req, res) => {
   });
 };
 
+const getPaymentSettings = async (req, res) => {
+  const result = await paymentSettingsService.getSettings();
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const updatePaymentSettings = async (req, res) => {
+  const result = await paymentSettingsService.updateSettings(req.body);
+
+  res.status(200).json({
+    success: true,
+    message: 'Payment settings updated successfully',
+    data: result,
+  });
+};
+
 module.exports = {
   createOrder,
   verifyPayment,
@@ -66,4 +86,6 @@ module.exports = {
   webhook,
   getOrderByEventId,
   getOrdersByEventIdForAdmin,
+  getPaymentSettings,
+  updatePaymentSettings,
 };

@@ -18,6 +18,30 @@ const logColors = {
 
 winston.addColors(logColors);
 
+const safeStringify = (value) => {
+  const seen = new WeakSet();
+  return JSON.stringify(
+    value,
+    (_key, val) => {
+      if (val instanceof Error) {
+        return {
+          name: val.name,
+          message: val.message,
+          stack: val.stack,
+        };
+      }
+
+      if (typeof val === 'object' && val !== null) {
+        if (seen.has(val)) return '[Circular]';
+        seen.add(val);
+      }
+
+      return val;
+    },
+    2
+  );
+};
+
 const format = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
   winston.format.colorize({ all: true }),
@@ -25,7 +49,7 @@ const format = winston.format.combine(
     const { timestamp, level, message, ...meta } = info;
     let metaString = '';
     if (Object.keys(meta).length > 0) {
-      metaString = `\n${JSON.stringify(meta, null, 2)}`;
+      metaString = `\n${safeStringify(meta)}`;
     }
     return `${timestamp} [${level}]: ${message}${metaString}`;
   })

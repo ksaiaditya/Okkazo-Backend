@@ -205,12 +205,15 @@ const searchAvailableServices = async (filters = {}) => {
 
   const query = { status: 'Active' };
 
+  const normalizedCategory = String(serviceCategory || '').trim();
+  const isVenueCategory = normalizedCategory === 'Venue';
+
   if (businessName && String(businessName).trim()) {
     query.businessName = { $regex: String(businessName).trim(), $options: 'i' };
   }
 
-  if (serviceCategory && String(serviceCategory).trim()) {
-    query.serviceCategory = String(serviceCategory).trim();
+  if (normalizedCategory) {
+    query.serviceCategory = normalizedCategory;
   }
 
   if (latitude !== undefined && longitude !== undefined) {
@@ -225,8 +228,23 @@ const searchAvailableServices = async (filters = {}) => {
     const latDelta = radius / 111;
     const lngDelta = radius / (111 * Math.cos((lat * Math.PI) / 180));
 
-    query.latitude = { $gte: lat - latDelta, $lte: lat + latDelta };
-    query.longitude = { $gte: lng - lngDelta, $lte: lng + lngDelta };
+    // Venue vendors can have multiple venue locations across cities.
+    // For Venue only, filter using the venue location coordinates stored on the service.
+    if (isVenueCategory) {
+      query.$or = [
+        {
+          'details.locationLat': { $gte: lat - latDelta, $lte: lat + latDelta },
+          'details.locationLng': { $gte: lng - lngDelta, $lte: lng + lngDelta },
+        },
+        {
+          'details.lat': { $gte: lat - latDelta, $lte: lat + latDelta },
+          'details.lng': { $gte: lng - lngDelta, $lte: lng + lngDelta },
+        },
+      ];
+    } else {
+      query.latitude = { $gte: lat - latDelta, $lte: lat + latDelta };
+      query.longitude = { $gte: lng - lngDelta, $lte: lng + lngDelta };
+    }
   }
 
   // Find blocked vendors for the requested day range
