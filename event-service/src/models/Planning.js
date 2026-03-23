@@ -239,6 +239,51 @@ const PlanningSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    depositPaidAmountPaise: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
+    depositPaidCurrency: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    depositPaidAt: {
+      type: Date,
+      default: null,
+    },
+
+    vendorConfirmationPaid: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    vendorConfirmationPaidAmountPaise: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
+    vendorConfirmationPaidCurrency: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    vendorConfirmationPaidAt: {
+      type: Date,
+      default: null,
+    },
+
+    quoteLockedAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    quoteLockedVersion: {
+      type: Number,
+      default: null,
+      min: 1,
+    },
     fullPaymentPaid: {
       type: Boolean,
       default: false,

@@ -66,7 +66,11 @@ const startConsuming = async () => {
             }
           } else if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
             // ── Planning deposit confirmed ─────────────────────────────────
-            const planning = await planningService.markPlanningDepositPaid(payload.eventId);
+            const planning = await planningService.markPlanningDepositPaid(payload.eventId, {
+              amountPaise: payload.amount,
+              currency: payload.currency,
+              paidAt: payload.paidAt,
+            });
 
             try {
               await publishEvent('PLANNING_DEPOSIT_PAYMENT_CONFIRMED', {
@@ -82,6 +86,30 @@ const startConsuming = async () => {
               });
             } catch (publishError) {
               logger.error('Failed to publish PLANNING_DEPOSIT_PAYMENT_CONFIRMED event:', publishError.message);
+            }
+          } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+            // ── Planning vendor confirmation confirmed ────────────────────
+            const planning = await planningService.markPlanningVendorConfirmationPaid(payload.eventId, {
+              amountPaise: payload.amount,
+              currency: payload.currency,
+              paidAt: payload.paidAt,
+            });
+
+            try {
+              await publishEvent('PLANNING_VENDOR_CONFIRMATION_PAYMENT_CONFIRMED', {
+                eventId: planning.eventId,
+                authId: planning.authId,
+                status: planning.status,
+                platformFeePaid: Boolean(planning.platformFeePaid) || Boolean(planning.isPaid),
+                depositPaid: Boolean(planning.depositPaid),
+                vendorConfirmationPaid: Boolean(planning.vendorConfirmationPaid),
+                paymentOrderId: payload.paymentOrderId,
+                razorpayOrderId: payload.razorpayOrderId,
+                razorpayPaymentId: payload.razorpayPaymentId,
+                paidAt: payload.paidAt,
+              });
+            } catch (publishError) {
+              logger.error('Failed to publish PLANNING_VENDOR_CONFIRMATION_PAYMENT_CONFIRMED event:', publishError.message);
             }
           } else {
             // ── Planning payment confirmed (default: platform fee) ──────────

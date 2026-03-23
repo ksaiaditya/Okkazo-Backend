@@ -61,6 +61,13 @@ router.get(
   planningController.getAllPlannings
 );
 
+// GET /planning/:eventId/quote/latest - Get latest locked quote snapshot
+router.get(
+  '/planning/:eventId/quote/latest',
+  authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
+  planningController.getPlanningQuoteLatest
+);
+
 // GET /planning/:eventId - Get a single planning by eventId
 router.get(
   '/planning/:eventId',

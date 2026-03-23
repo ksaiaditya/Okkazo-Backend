@@ -15,7 +15,18 @@ const {
 
 const createOrderSchema = Joi.object({
   eventId: Joi.string().trim().required(),
-  orderType: Joi.string().trim().valid('PLANNING EVENT', 'PLANNING EVENT DEPOSIT FEE', 'PROMOTE EVENT', 'TICKET SALE', 'REFUND').required(),
+  orderType: Joi
+    .string()
+    .trim()
+    .valid(
+      'PLANNING EVENT',
+      'PLANNING EVENT DEPOSIT FEE',
+      'PLANNING EVENT VENDOR CONFIRMATION FEE',
+      'PROMOTE EVENT',
+      'TICKET SALE',
+      'REFUND'
+    )
+    .required(),
   amount: Joi.number().positive().optional(),
   currency: Joi.string().trim().uppercase().length(3).optional(),
   // Razorpay receipt has a hard 40-character limit
@@ -133,6 +144,22 @@ const getVendorSelectionForUser = async (eventId, user) => {
   return response.data?.data;
 };
 
+const getPlanningQuoteLatestForUser = async (eventId, user) => {
+  const eventServiceUrl = process.env.EVENT_SERVICE_URL || 'http://event-service:8086';
+  const response = await axios.get(`${eventServiceUrl}/planning/${encodeURIComponent(eventId)}/quote/latest`, {
+    timeout: 10000,
+    headers: {
+      'x-auth-id': user.authId,
+      'x-user-id': user.userId || '',
+      'x-user-email': user.email || '',
+      'x-user-username': user.username || '',
+      'x-user-role': user.role || 'USER',
+    },
+  });
+
+  return response.data?.data;
+};
+
 const createOrder = async (payload, user) => {
   if (!user?.authId) {
     throw createApiError(401, 'User authentication information missing');
@@ -176,6 +203,28 @@ const createOrder = async (payload, user) => {
     if (Boolean(upstreamRecord.depositPaid)) {
       throw createApiError(409, 'Deposit is already paid for this event');
     }
+  } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+    const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
+    if (!planningPlatformFeePaid) {
+      throw createApiError(409, 'Planning fee must be paid before paying vendor confirmation');
+    }
+    if (!Boolean(upstreamRecord.depositPaid)) {
+      throw createApiError(409, 'Deposit must be paid before vendor confirmation');
+    }
+
+    const depositPaidAmountPaise = upstreamRecord.depositPaidAmountPaise;
+    if (depositPaidAmountPaise == null) {
+      throw createApiError(409, 'Deposit amount is not recorded yet for this event');
+    }
+
+    const normalizedStatus = String(upstreamRecord.status || '').trim().toUpperCase();
+    if (normalizedStatus !== 'APPROVED') {
+      throw createApiError(409, 'Planning must be APPROVED before paying vendor confirmation');
+    }
+
+    if (Boolean(upstreamRecord.vendorConfirmationPaid)) {
+      throw createApiError(409, 'Vendor confirmation is already paid for this event');
+    }
   } else {
     const alreadyPaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
     if (alreadyPaid) {
@@ -184,9 +233,9 @@ const createOrder = async (payload, user) => {
   }
 
   // For most order types, it's fine to reuse the latest CREATED order.
-  // For deposit orders, the amount depends on the latest VendorSelection totals,
-  // so we only reuse an existing order if the amount still matches.
-  if (orderType !== 'PLANNING EVENT DEPOSIT FEE') {
+  // For deposit + vendor confirmation orders, the amount is derived from upstream state,
+  // so only reuse an existing order if the amount still matches.
+  if (orderType !== 'PLANNING EVENT DEPOSIT FEE' && orderType !== 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
     const activeOrder = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,
@@ -212,6 +261,7 @@ const createOrder = async (payload, user) => {
   }
 
   let amountInInr;
+  let amountInPaiseOverride = null;
   let depositPercent = null;
   const currency = value.currency || 'INR';
   if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
@@ -239,13 +289,69 @@ const createOrder = async (payload, user) => {
     if (!Number.isFinite(amountInInr) || amountInInr <= 0) {
       throw createApiError(409, 'Computed deposit amount is invalid');
     }
+  } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
+    let quote;
+    try {
+      quote = await getPlanningQuoteLatestForUser(value.eventId, user);
+    } catch (err) {
+      if (isAxiosLikeError(err)) {
+        throw normalizeAxiosError(err, { upstreamName: 'event-service' });
+      }
+      throw err;
+    }
+
+    const vendorMinPaise = Number(quote?.vendorSubtotal?.minPaise ?? 0);
+    if (!Number.isFinite(vendorMinPaise) || vendorMinPaise <= 0) {
+      throw createApiError(409, 'Cannot compute vendor confirmation amount without a locked quote');
+    }
+
+    const depositPaidAmountPaise = Number(upstreamRecord.depositPaidAmountPaise ?? 0);
+    if (!Number.isFinite(depositPaidAmountPaise) || depositPaidAmountPaise < 0) {
+      throw createApiError(409, 'Deposit amount is invalid for this event');
+    }
+
+    const confirmationDuePaise = Math.max(0, Math.round((vendorMinPaise * 25) / 100) - depositPaidAmountPaise);
+    if (!Number.isFinite(confirmationDuePaise) || confirmationDuePaise <= 0) {
+      throw createApiError(409, 'No vendor confirmation amount is due for this event');
+    }
+
+    amountInPaiseOverride = confirmationDuePaise;
   } else {
     amountInInr = value.amount || Number(process.env.DEFAULT_PLATFORM_FEE_INR) || 15000;
   }
 
-  const amountInPaise = Math.round(Number(amountInInr) * 100);
+  const amountInPaise = amountInPaiseOverride != null
+    ? Math.round(Number(amountInPaiseOverride))
+    : Math.round(Number(amountInInr) * 100);
 
   if (orderType === 'PLANNING EVENT DEPOSIT FEE') {
+    const matchingActive = await PaymentOrder.findOne({
+      eventId: value.eventId,
+      authId: user.authId,
+      orderType,
+      status: 'CREATED',
+      currency,
+      amount: amountInPaise,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (matchingActive) {
+      return {
+        eventId: matchingActive.eventId,
+        orderId: matchingActive._id,
+        razorpayOrderId: matchingActive.razorpayOrderId,
+        transactionId: matchingActive.transactionId,
+        orderType: matchingActive.orderType,
+        amount: matchingActive.amount,
+        currency: matchingActive.currency,
+        keyId: process.env.RAZORPAY_KEY_ID,
+        status: matchingActive.status,
+      };
+    }
+  }
+
+  if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
     const matchingActive = await PaymentOrder.findOne({
       eventId: value.eventId,
       authId: user.authId,
@@ -286,6 +392,13 @@ const createOrder = async (payload, user) => {
           ? {
               computedFrom: 'vendor-selection.totalMinAmount',
               planningDepositPercent: depositPercent,
+            }
+          : {}),
+        ...(orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE'
+          ? {
+              computedFrom: 'planning-quote.vendorSubtotal.minPaise',
+              vendorConfirmationPercent: 25,
+              depositPaidAmountPaise: upstreamRecord.depositPaidAmountPaise,
             }
           : {}),
         ...(value.notes || {}),

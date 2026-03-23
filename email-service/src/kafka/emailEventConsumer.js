@@ -23,6 +23,9 @@ const sentPaymentEmails = new Map();
 const alternativesDedupeTtlMs = parseInt(process.env.ALTERNATIVES_EMAIL_DEDUPE_TTL_MS || '3600000', 10);
 const sentAlternativesEmails = new Map();
 
+const quoteDedupeTtlMs = parseInt(process.env.QUOTE_EMAIL_DEDUPE_TTL_MS || '86400000', 10);
+const sentQuoteEmails = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
@@ -38,6 +41,202 @@ const pruneAlternativesSentCache = () => {
     if (now - ts > alternativesDedupeTtlMs) {
       sentAlternativesEmails.delete(key);
     }
+  }
+};
+
+const pruneQuoteSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentQuoteEmails.entries()) {
+    if (now - ts > quoteDedupeTtlMs) {
+      sentQuoteEmails.delete(key);
+    }
+  }
+};
+
+const formatMoneyRangeFromPaise = (minPaise, maxPaise) => {
+  const min = Number(minPaise);
+  const max = Number(maxPaise);
+  if (!Number.isFinite(min) || min <= 0) return '—';
+  const safeMax = Number.isFinite(max) && max > 0 ? max : min;
+  const toInr = (p) => (Math.round(Number(p || 0)) / 100);
+  const fmt = (n) => `₹${Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+  return `${fmt(toInr(min))} - ${fmt(toInr(safeMax))}`;
+};
+
+const formatMoneyFromPaise = (paise) => {
+  const n = Number(paise);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const inr = Math.round(n) / 100;
+  return `₹${inr.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+};
+
+const fetchPlanningQuoteLatestForUser = async (eventId, user) => {
+  const response = await axios.get(`${eventServiceUrl}/planning/${encodeURIComponent(eventId)}/quote/latest`, {
+    timeout: httpTimeoutMs,
+    headers: {
+      'x-auth-id': user?.authId || '',
+      'x-user-id': user?._id?.toString?.() || user?.id || '',
+      'x-user-email': user?.email || '',
+      'x-user-username': user?.name || user?.username || '',
+      'x-user-role': user?.role || 'USER',
+    },
+  });
+
+  return response.data?.data;
+};
+
+const handlePlanningQuoteLocked = async (event) => {
+  const { eventId, authId, version } = event || {};
+
+  if (!eventId || !authId) {
+    logger.error('PLANNING_QUOTE_LOCKED missing required fields', { event });
+    return;
+  }
+
+  pruneQuoteSentCache();
+
+  const userDedupeKey = `${String(eventId)}:${String(version || 'latest')}:USER`;
+  if (sentQuoteEmails.has(userDedupeKey)) {
+    logger.info('Skipping duplicate quote email (user)', { eventId, version, userDedupeKey });
+    return;
+  }
+
+  const owner = await fetchUserByAuthId(authId);
+  if (!owner?.email) {
+    logger.error('Unable to send quote email: owner email not found', { authId, eventId });
+    return;
+  }
+
+  let planning = null;
+  try {
+    planning = await fetchPlanningByEventIdForUser(eventId, { ...owner, role: owner?.role || 'USER' });
+  } catch (e) {
+    logger.warn('Failed to fetch planning for quote email (non-blocking)', { eventId, authId, message: e?.message || String(e) });
+  }
+
+  let quote = null;
+  try {
+    quote = await fetchPlanningQuoteLatestForUser(eventId, { ...owner, role: owner?.role || 'USER' });
+  } catch (e) {
+    logger.error('Failed to fetch quote for PLANNING_QUOTE_LOCKED', { eventId, authId, message: e?.message || String(e) });
+    return;
+  }
+
+  const eventTitle = planning?.eventTitle || planning?.eventName || 'Event';
+  const eventDate = planning?.eventDate || planning?.schedule?.startAt || quote?.eventStartAt || null;
+  const eventLocation = planning?.location?.name || planning?.location?.location || null;
+
+  const vendorCache = new Map();
+  const resolveVendorName = async (vendorAuthId) => {
+    const key = String(vendorAuthId || '').trim();
+    if (!key) return '—';
+    if (vendorCache.has(key)) return vendorCache.get(key);
+    const u = await fetchUserByAuthId(key);
+    const name = u?.businessName || u?.vendorName || u?.name || u?.username || 'Vendor';
+    vendorCache.set(key, name);
+    return name;
+  };
+
+  const quoteItems = Array.isArray(quote?.items) ? quote.items : [];
+  const userItems = [];
+  for (const it of quoteItems) {
+    const vendorName = await resolveVendorName(it?.vendorAuthId);
+    userItems.push({
+      service: it?.service || 'Service',
+      vendorName,
+      clientRange: formatMoneyRangeFromPaise(it?.clientTotal?.minPaise, it?.clientTotal?.maxPaise),
+    });
+  }
+
+  const promotionsTotal = quote?.promotionsTotal?.minPaise
+    ? formatMoneyFromPaise(quote.promotionsTotal.minPaise)
+    : null;
+  const grandTotal = formatMoneyRangeFromPaise(quote?.clientGrandTotal?.minPaise, quote?.clientGrandTotal?.maxPaise);
+
+  await emailService.sendPlanningQuoteLockedUserEmail(owner.email, {
+    recipientName: owner?.name || owner?.username || 'there',
+    eventId,
+    eventTitle,
+    eventDate,
+    eventLocation,
+    version: quote?.version || version || 1,
+    items: userItems,
+    promotionsTotal,
+    grandTotal,
+  });
+
+  sentQuoteEmails.set(userDedupeKey, Date.now());
+
+  // Vendor emails (per vendorAuthId)
+  const items = quoteItems;
+  const byVendor = new Map();
+  for (const it of items) {
+    const vendorAuth = (it?.vendorAuthId || '').toString().trim();
+    if (!vendorAuth) continue;
+    if (!byVendor.has(vendorAuth)) byVendor.set(vendorAuth, []);
+    byVendor.get(vendorAuth).push(it);
+  }
+
+  for (const [vendorAuthId, vendorItemsRaw] of byVendor.entries()) {
+    const vendorDedupeKey = `${String(eventId)}:${String(quote?.version || version || 'latest')}:VENDOR:${vendorAuthId}`;
+    pruneQuoteSentCache();
+    if (sentQuoteEmails.has(vendorDedupeKey)) {
+      logger.info('Skipping duplicate quote email (vendor)', { eventId, version, vendorAuthId });
+      continue;
+    }
+
+    const vendorUser = await fetchUserByAuthId(vendorAuthId);
+    const vendorEmail = vendorUser?.email;
+    if (!vendorEmail) {
+      logger.warn('Skipping vendor quote email: vendor email not found', { vendorAuthId, eventId });
+      continue;
+    }
+
+    let vendorMin = 0;
+    let vendorMax = 0;
+    let chargeMin = 0;
+    let chargeMax = 0;
+    let clientMin = 0;
+    let clientMax = 0;
+
+    const vendorItems = vendorItemsRaw.map((it) => {
+      const vMin = Number(it?.vendorTotal?.minPaise || 0);
+      const vMax = Number(it?.vendorTotal?.maxPaise || 0);
+      const cMin = Number(it?.serviceCharge?.minPaise || 0);
+      const cMax = Number(it?.serviceCharge?.maxPaise || 0);
+      const clMin = Number(it?.clientTotal?.minPaise || 0);
+      const clMax = Number(it?.clientTotal?.maxPaise || 0);
+
+      if (Number.isFinite(vMin)) vendorMin += vMin;
+      if (Number.isFinite(vMax)) vendorMax += vMax;
+      if (Number.isFinite(cMin)) chargeMin += cMin;
+      if (Number.isFinite(cMax)) chargeMax += cMax;
+      if (Number.isFinite(clMin)) clientMin += clMin;
+      if (Number.isFinite(clMax)) clientMax += clMax;
+
+      return {
+        service: it?.service || 'Service',
+        vendorRange: formatMoneyRangeFromPaise(it?.vendorTotal?.minPaise, it?.vendorTotal?.maxPaise),
+        chargeRange: formatMoneyRangeFromPaise(it?.serviceCharge?.minPaise, it?.serviceCharge?.maxPaise),
+        clientRange: formatMoneyRangeFromPaise(it?.clientTotal?.minPaise, it?.clientTotal?.maxPaise),
+        commissionPercent: Number(it?.commissionPercent || 0),
+      };
+    });
+
+    await emailService.sendPlanningQuoteLockedVendorEmail(vendorEmail, {
+      recipientName: vendorUser?.name || vendorUser?.username || 'there',
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      version: quote?.version || version || 1,
+      items: vendorItems,
+      vendorSubtotal: formatMoneyRangeFromPaise(vendorMin, vendorMax),
+      serviceChargeTotal: formatMoneyRangeFromPaise(chargeMin, chargeMax),
+      clientTotal: formatMoneyRangeFromPaise(clientMin, clientMax),
+    });
+
+    sentQuoteEmails.set(vendorDedupeKey, Date.now());
   }
 };
 
@@ -301,6 +500,11 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'VENDOR_REQUEST_REJECTED_ALTERNATIVES':
       if (topic === eventTopic) {
         await handleVendorRequestRejectedAlternatives(payload);
+      }
+      break;
+    case 'PLANNING_QUOTE_LOCKED':
+      if (topic === eventTopic) {
+        await handlePlanningQuoteLocked(payload);
       }
       break;
     // Payment events that are useful for audit/analytics but do not trigger emails here

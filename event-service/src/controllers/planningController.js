@@ -1,4 +1,5 @@
 const planningService = require('../services/planningService');
+const planningQuoteService = require('../services/planningQuoteService');
 const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
@@ -326,6 +327,47 @@ const getPlanningByEventId = async (req, res) => {
   } catch (error) {
     logger.error('Error in getPlanningByEventId:', error);
     res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * Get the latest locked quote snapshot for a planning.
+ * GET /planning/:eventId/quote/latest
+ */
+const getPlanningQuoteLatest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const planning = await planningService.getPlanningByEventId(eventId);
+    if (
+      req.user.role !== 'ADMIN' &&
+      req.user.role !== 'MANAGER' &&
+      planning.authId !== req.user.authId
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. You can only view your own plannings.',
+      });
+    }
+
+    const quote = await planningQuoteService.getLatestSnapshotForEvent({ eventId });
+    return res.status(200).json({
+      success: true,
+      data: quote,
+    });
+  } catch (error) {
+    logger.error('Error in getPlanningQuoteLatest:', error);
+    return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
     });
@@ -999,6 +1041,7 @@ module.exports = {
   createPlanning,
   getMyPlannings,
   getPlanningByEventId,
+  getPlanningQuoteLatest,
   getAllPlannings,
   updatePlanningStatus,
   unassignPlanningManager,

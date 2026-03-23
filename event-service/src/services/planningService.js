@@ -7,6 +7,7 @@ const { STATUS, STATUS_VALUES, CATEGORY } = require('../utils/planningConstants'
 const { PROMOTE_STATUS, ADMIN_DECISION_STATUS } = require('../utils/promoteConstants');
 const vendorSelectionService = require('./vendorSelectionService');
 const promoteConfigService = require('./promoteConfigService');
+const planningQuoteService = require('./planningQuoteService');
 const mongoose = require('mongoose');
 const { fetchUserById } = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
@@ -79,6 +80,7 @@ const normalizePlanningForApi = (planning, platformFeeFallback) => {
     ...planning,
     platformFeePaid: Boolean(planning.platformFeePaid) || Boolean(planning.isPaid),
     depositPaid: Boolean(planning.depositPaid),
+    vendorConfirmationPaid: Boolean(planning.vendorConfirmationPaid),
     fullPaymentPaid: Boolean(planning.fullPaymentPaid),
   };
 
@@ -252,6 +254,17 @@ const updatePlanningStatus = async (
 
   await planning.save();
   logger.info(`Planning status updated: ${eventId} -> ${status}`);
+
+  if (planning.status === STATUS.APPROVED) {
+    try {
+      await planningQuoteService.lockQuoteAtApproved({ eventId: planning.eventId, lockedByAuthId: assignedManagerId || null });
+    } catch (err) {
+      logger.warn('Failed to lock quote after planning status APPROVED', {
+        eventId: planning.eventId,
+        message: err?.message,
+      });
+    }
+  }
 
   // Best-effort: seed event chat between user + assigned manager.
   if (assignedManagerId) {
@@ -707,7 +720,7 @@ const markPlanningPaid = async (eventId) => {
 /**
  * Mark planning deposit as paid after verified deposit payment event.
  */
-const markPlanningDepositPaid = async (eventId) => {
+const markPlanningDepositPaid = async (eventId, { amountPaise = null, currency = null, paidAt = null } = {}) => {
   if (!eventId || eventId.trim() === '') {
     throw createApiError(400, 'Event ID is required');
   }
@@ -717,12 +730,72 @@ const markPlanningDepositPaid = async (eventId) => {
     throw createApiError(404, 'Planning not found');
   }
 
+  const nextAmount = amountPaise != null ? Number(amountPaise) : null;
+  const nextCurrency = currency != null ? String(currency).trim() : null;
+  const nextPaidAt = paidAt ? new Date(paidAt) : null;
+
   if (!planning.depositPaid) {
     planning.depositPaid = true;
-    await planning.save({ validateBeforeSave: false });
-    logger.info(`Planning deposit marked as paid: ${eventId}`);
   }
 
+  if (nextAmount != null && Number.isFinite(nextAmount) && nextAmount >= 0) {
+    if (planning.depositPaidAmountPaise == null) planning.depositPaidAmountPaise = Math.round(nextAmount);
+  }
+  if (nextCurrency && planning.depositPaidCurrency == null) {
+    planning.depositPaidCurrency = nextCurrency;
+  }
+  if (nextPaidAt && planning.depositPaidAt == null && !Number.isNaN(nextPaidAt.getTime())) {
+    planning.depositPaidAt = nextPaidAt;
+  }
+
+  await planning.save({ validateBeforeSave: false });
+  logger.info(`Planning deposit marked as paid: ${eventId}`);
+
+  return planning;
+};
+
+/**
+ * Mark planning vendor confirmation payment as paid and transition to CONFIRMED.
+ */
+const markPlanningVendorConfirmationPaid = async (
+  eventId,
+  { amountPaise = null, currency = null, paidAt = null } = {}
+) => {
+  if (!eventId || eventId.trim() === '') {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: eventId.trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  const nextAmount = amountPaise != null ? Number(amountPaise) : null;
+  const nextCurrency = currency != null ? String(currency).trim() : null;
+  const nextPaidAt = paidAt ? new Date(paidAt) : null;
+
+  if (!planning.vendorConfirmationPaid) {
+    planning.vendorConfirmationPaid = true;
+  }
+
+  if (nextAmount != null && Number.isFinite(nextAmount) && nextAmount >= 0) {
+    if (planning.vendorConfirmationPaidAmountPaise == null) {
+      planning.vendorConfirmationPaidAmountPaise = Math.round(nextAmount);
+    }
+  }
+  if (nextCurrency && planning.vendorConfirmationPaidCurrency == null) {
+    planning.vendorConfirmationPaidCurrency = nextCurrency;
+  }
+  if (nextPaidAt && planning.vendorConfirmationPaidAt == null && !Number.isNaN(nextPaidAt.getTime())) {
+    planning.vendorConfirmationPaidAt = nextPaidAt;
+  }
+
+  if (String(planning.status || '').trim() !== STATUS.CONFIRMED) {
+    planning.status = STATUS.CONFIRMED;
+  }
+
+  await planning.save({ validateBeforeSave: false });
+  logger.info(`Planning vendor confirmation marked as paid: ${eventId} -> ${planning.status}`);
   return planning;
 };
 
@@ -840,6 +913,7 @@ module.exports = {
   getPlanningStats,
   markPlanningPaid,
   markPlanningDepositPaid,
+  markPlanningVendorConfirmationPaid,
   confirmPlanning,
   getAdminDashboard,
   getPlanningsForManager,

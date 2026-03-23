@@ -392,6 +392,98 @@ const sendVendorRejectedAlternativesEmail = async (email, details) => {
   }
 };
 
+/**
+ * Send finalized quotation email to a user (commission hidden; prices are client totals).
+ */
+const sendPlanningQuoteLockedUserEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      version,
+      items,
+      promotionsTotal,
+      grandTotal,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('quote-locked-user');
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      eventDate: eventDate || null,
+      eventLocation: eventLocation || null,
+      version: version || 1,
+      items: Array.isArray(items) ? items : [],
+      promotionsTotal: promotionsTotal || null,
+      grandTotal: grandTotal || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Final Quotation - ${eventTitle}`, html);
+    logger.info('Planning quote locked user email sent', { email, eventId, version });
+  } catch (error) {
+    logger.error('Error sending planning quote locked user email:', error);
+    throw error;
+  }
+};
+
+/**
+ * Send finalized quotation email to a vendor (shows their services + commission/service-charge breakdown).
+ */
+const sendPlanningQuoteLockedVendorEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      version,
+      items,
+      vendorSubtotal,
+      serviceChargeTotal,
+      clientTotal,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('quote-locked-vendor');
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      eventDate: eventDate || null,
+      eventLocation: eventLocation || null,
+      version: version || 1,
+      items: Array.isArray(items) ? items : [],
+      vendorSubtotal: vendorSubtotal || null,
+      serviceChargeTotal: serviceChargeTotal || null,
+      clientTotal: clientTotal || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Final Quotation (Vendor) - ${eventTitle}`, html);
+    logger.info('Planning quote locked vendor email sent', { email, eventId, version });
+  } catch (error) {
+    logger.error('Error sending planning quote locked vendor email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -404,4 +496,6 @@ module.exports = {
   sendManagerAccountCreatedEmail,
   sendPaymentSuccessEmail,
   sendVendorRejectedAlternativesEmail,
+  sendPlanningQuoteLockedUserEmail,
+  sendPlanningQuoteLockedVendorEmail,
 };

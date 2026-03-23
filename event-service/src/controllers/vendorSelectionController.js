@@ -11,6 +11,7 @@ const { publishEvent } = require('../kafka/eventProducer');
 const { ensureEventChatSeeded } = require('../services/chatSeedService');
 const { sendEventConversationMessage } = require('../services/chatServiceClient');
 const { encodeRichChatMessage } = require('../utils/richChat');
+const planningQuoteService = require('../services/planningQuoteService');
 
 const defaultVendorServiceUrl = process.env.SERVICE_HOST
   ? 'http://vendor-service:8084' // docker-compose service name
@@ -669,6 +670,15 @@ const acceptVendorRequest = async (req, res) => {
       await Planning.updateOne({ eventId }, { $set: { status: PLANNING_STATUS.APPROVED } });
       planningStatusUpdated = true;
       nextPlanningStatus = PLANNING_STATUS.APPROVED;
+
+      try {
+        await planningQuoteService.lockQuoteAtApproved({ eventId, lockedByAuthId: vendorAuthId });
+      } catch (err) {
+        logger.warn('Failed to lock quote after vendors accepted', {
+          eventId,
+          message: err?.message,
+        });
+      }
     }
 
     return res.status(200).json({
