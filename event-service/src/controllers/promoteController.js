@@ -1,9 +1,55 @@
 const promoteService = require('../services/promoteService');
-const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
+const { resolveUserServiceIdFromAuthId, fetchUserById } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 const promoteConfigService = require('../services/promoteConfigService');
+
+const buildManagerProfile = (user) => {
+  if (!user || typeof user !== 'object') return null;
+  return {
+    id: user._id || user.id || null,
+    authId: user.authId || null,
+    name: user.name || user.fullName || null,
+    fullName: user.fullName || null,
+    avatar: user.avatar || null,
+    assignedRole: user.assignedRole || null,
+    department: user.department || null,
+    role: user.role || null,
+    isActive: Boolean(user.isActive),
+    lastLogin: user.lastLogin || null,
+  };
+};
+
+const enrichPromoteWithManagerProfile = async (promote) => {
+  if (!promote || typeof promote !== 'object') return promote;
+
+  const assignedManagerId = String(promote.assignedManagerId || '').trim();
+  if (!assignedManagerId) {
+    return {
+      ...promote,
+      managerProfile: null,
+    };
+  }
+
+  try {
+    const manager = await fetchUserById(assignedManagerId);
+    return {
+      ...promote,
+      managerProfile: buildManagerProfile(manager),
+    };
+  } catch (error) {
+    logger.warn('Failed to enrich promote with manager profile', {
+      eventId: promote.eventId,
+      assignedManagerId,
+      error: error?.message,
+    });
+    return {
+      ...promote,
+      managerProfile: null,
+    };
+  }
+};
 
 // ─── Create a new promote record ──────────────────────────────────────────────
 /**
@@ -109,7 +155,14 @@ const getMyPromotes = async (req, res) => {
 
     const result = await promoteService.getMyPromotes(req.user.authId, page, limit);
 
-    return res.status(200).json({ success: true, ...result });
+    const promotes = Array.isArray(result?.promotes) ? result.promotes : [];
+    const enrichedPromotes = await Promise.all(promotes.map(enrichPromoteWithManagerProfile));
+
+    return res.status(200).json({
+      success: true,
+      ...result,
+      promotes: enrichedPromotes,
+    });
   } catch (error) {
     logger.error('Error in getMyPromotes:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });
@@ -135,7 +188,8 @@ const getPromoteByEventId = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    return res.status(200).json({ success: true, data: promote });
+    const enrichedPromote = await enrichPromoteWithManagerProfile(promote);
+    return res.status(200).json({ success: true, data: enrichedPromote });
   } catch (error) {
     logger.error('Error in getPromoteByEventId:', error);
     return res.status(error.statusCode || 500).json({ success: false, message: error.message });

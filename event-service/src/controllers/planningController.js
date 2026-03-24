@@ -1,6 +1,6 @@
 const planningService = require('../services/planningService');
 const planningQuoteService = require('../services/planningQuoteService');
-const { resolveUserServiceIdFromAuthId } = require('../services/userServiceClient');
+const { resolveUserServiceIdFromAuthId, fetchUserById } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
@@ -78,6 +78,49 @@ const ensureAccessToPlanning = async ({ eventId, user }) => {
   }
 
   return planning;
+};
+
+const buildManagerProfile = (user) => {
+  if (!user || typeof user !== 'object') return null;
+
+  return {
+    id: user._id || user.id || null,
+    authId: user.authId || null,
+    name: user.name || user.fullName || user.username || 'Event Manager',
+    assignedRole: user.assignedRole || user.role || user.department || 'Manager',
+    department: user.department || null,
+  };
+};
+
+const enrichPlanningWithManagerProfile = async (planning) => {
+  if (!planning || typeof planning !== 'object') return planning;
+
+  const assignedManagerId = String(planning.assignedManagerId || '').trim();
+  if (!assignedManagerId) {
+    return {
+      ...planning,
+      managerProfile: null,
+    };
+  }
+
+  try {
+    const manager = await fetchUserById(assignedManagerId);
+    return {
+      ...planning,
+      managerProfile: buildManagerProfile(manager),
+    };
+  } catch (error) {
+    logger.warn('Failed to enrich planning manager profile', {
+      eventId: planning.eventId,
+      assignedManagerId,
+      message: error?.message,
+    });
+
+    return {
+      ...planning,
+      managerProfile: null,
+    };
+  }
 };
 
 /**
@@ -320,9 +363,11 @@ const getPlanningByEventId = async (req, res) => {
       });
     }
 
+    const enrichedPlanning = await enrichPlanningWithManagerProfile(planning);
+
     res.status(200).json({
       success: true,
-      data: planning,
+      data: enrichedPlanning,
     });
   } catch (error) {
     logger.error('Error in getPlanningByEventId:', error);
