@@ -81,6 +81,69 @@ const getMyApplication = async (req, res) => {
 };
 
 /**
+ * Update my vendor profile fields
+ * PATCH /api/vendor/me/application/profile
+ */
+const updateMyApplicationProfile = async (req, res) => {
+  try {
+    const authId = req.user?.authId;
+
+    if (!authId) {
+      return res.status(401).json(
+        formatErrorResponse('UNAUTHORIZED', 'User not authenticated')
+      );
+    }
+
+    const {
+      description,
+      location,
+      place,
+      country,
+      latitude,
+      longitude,
+    } = req.body || {};
+
+    const hasAnyField = [description, location, place, country, latitude, longitude]
+      .some((value) => value !== undefined);
+
+    if (!hasAnyField) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'At least one profile field is required')
+      );
+    }
+
+    const updated = await vendorService.updateMyApplicationProfile(authId, {
+      description,
+      location,
+      place,
+      country,
+      latitude,
+      longitude,
+    });
+
+    return res.status(200).json(formatSuccessResponse(updated, 'Profile updated successfully'));
+  } catch (error) {
+    logger.error('Error in updateMyApplicationProfile:', error);
+
+    if (error.statusCode === 404) {
+      return res.status(404).json(
+        formatErrorResponse('APPLICATION_NOT_FOUND', error.message)
+      );
+    }
+
+    if (error.statusCode === 400) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', error.message)
+      );
+    }
+
+    return res.status(error.statusCode || 500).json(
+      formatErrorResponse('INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
  * Upload additional document
  * POST /api/vendor/registration/:applicationId/documents
  */
@@ -571,6 +634,31 @@ const getMyServices = async (req, res) => {
 };
 
 /**
+ * Get services by vendor authId (Admin/Manager)
+ * GET /api/vendor/services/vendor/:vendorAuthId
+ */
+const getVendorServicesByAuthId = async (req, res) => {
+  try {
+    const { vendorAuthId } = req.params;
+
+    if (!vendorAuthId || !String(vendorAuthId).trim()) {
+      return res.status(400).json(
+        formatErrorResponse('VALIDATION_ERROR', 'vendorAuthId is required')
+      );
+    }
+
+    const result = await vendorServiceCatalog.getMyServices(String(vendorAuthId).trim(), req.query);
+
+    return res.status(200).json(formatSuccessResponse(result));
+  } catch (error) {
+    logger.error('Error in getVendorServicesByAuthId:', error);
+    return res.status(error.statusCode || 500).json(
+      formatErrorResponse('INTERNAL_ERROR', error.message)
+    );
+  }
+};
+
+/**
  * Create / save a vendor service
  * POST /api/vendor/services
  */
@@ -917,6 +1005,7 @@ module.exports = {
   healthCheck,
   getApplicationStatus,
   getMyApplication,
+  updateMyApplicationProfile,
   uploadMyApplicationImage,
   uploadDocument,
   getAllApplications,
@@ -931,6 +1020,7 @@ module.exports = {
   searchPublicVendors,
   getPublicServiceById,
   getMyServices,
+  getVendorServicesByAuthId,
   updateVendorService,
   deleteVendorService,
   uploadVenueServiceImages,

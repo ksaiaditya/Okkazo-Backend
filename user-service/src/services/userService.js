@@ -3,6 +3,53 @@ const logger = require('../utils/logger');
 const createApiError = require('../utils/ApiError');
 const teamAccessEventProducer = require('../kafka/teamAccessEventProducer');
 
+const AUTH_SERVICE_INTERNAL_URL = process.env.AUTH_SERVICE_INTERNAL_URL || 'http://localhost:8081';
+
+const fetchAuthAccountStatuses = async (authIds = []) => {
+  if (!Array.isArray(authIds) || authIds.length === 0) {
+    return {};
+  }
+
+  try {
+    const params = new URLSearchParams();
+    authIds.forEach((id) => params.append('authIds', String(id)));
+
+    const response = await fetch(`${AUTH_SERVICE_INTERNAL_URL}/internal/account-status?${params.toString()}`);
+    if (!response.ok) {
+      logger.warn('Failed to fetch auth account statuses', { status: response.status });
+      return {};
+    }
+
+    const payload = await response.json().catch(() => ({}));
+    return payload?.data && typeof payload.data === 'object' ? payload.data : {};
+  } catch (error) {
+    logger.warn('Failed to fetch auth account statuses', { message: error.message });
+    return {};
+  }
+};
+
+const syncAuthTeamAccessStatus = async ({ authId, changedBy, action }) => {
+  const normalizedAction = String(action || '').toLowerCase();
+  const endpoint = normalizedAction === 'unblock'
+    ? '/internal/team-access/unblock'
+    : '/internal/team-access/block';
+
+  const params = new URLSearchParams({ authId: String(authId) });
+  if (changedBy) params.append('changedBy', String(changedBy));
+
+  const response = await fetch(`${AUTH_SERVICE_INTERNAL_URL}${endpoint}?${params.toString()}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload?.message || `Failed to ${normalizedAction || 'block'} account in auth service`);
+  }
+};
+
 /**
  * Create a new user
  */
@@ -213,6 +260,77 @@ const getAllUsers = async (filters = {}, page = 1, limit = 10) => {
 };
 
 /**
+ * Get platform users with auth-service account status enrichment
+ */
+const getPlatformUsers = async (filters = {}, page = 1, limit = 10) => {
+  try {
+    const query = {};
+
+    if (filters.role) {
+      query.role = filters.role.toUpperCase();
+    }
+
+    if (filters.search) {
+      query.$or = [
+        { name: new RegExp(filters.search, 'i') },
+        { fullName: new RegExp(filters.search, 'i') },
+        { email: new RegExp(filters.search, 'i') },
+      ];
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [users, total] = await Promise.all([
+      User.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .lean(),
+      User.countDocuments(query),
+    ]);
+
+    const authIds = users.map((user) => user?.authId).filter(Boolean);
+    const statusByAuthId = await fetchAuthAccountStatuses(authIds);
+
+    const usersWithStatus = users.map((user) => {
+      const authStatusRaw = statusByAuthId[String(user.authId)] || null;
+      const authStatus = authStatusRaw ? String(authStatusRaw).toUpperCase() : null;
+
+      let accountStatus = 'SUSPENDED';
+      if (authStatus === 'BLOCKED') {
+        accountStatus = 'BLOCKED';
+      } else if (authStatus === 'ACTIVE') {
+        accountStatus = 'ACTIVE';
+      } else if (authStatus === 'UNVERIFIED' || authStatus === 'DELETED') {
+        accountStatus = 'SUSPENDED';
+      } else if (user.isActive === false) {
+        accountStatus = 'BLOCKED';
+      } else if (user.lastLogin) {
+        accountStatus = 'ACTIVE';
+      }
+
+      return {
+        ...user,
+        accountStatus,
+      };
+    });
+
+    return {
+      users: usersWithStatus,
+      pagination: {
+        currentPage: Number(page),
+        totalPages: Math.ceil(total / limit),
+        totalUsers: total,
+        limit: Number(limit),
+      },
+    };
+  } catch (error) {
+    logger.error('Error fetching platform users:', error);
+    throw createApiError(500, 'Error fetching platform users');
+  }
+};
+
+/**
  * Update user's last login timestamp
  */
 const updateLastLogin = async (authId) => {
@@ -382,16 +500,26 @@ const blockTeamMember = async ({ authId, requestedByAuthId }) => {
     await user.save();
 
     try {
+      await syncAuthTeamAccessStatus({
+        authId: user.authId,
+        changedBy: requestedByAuthId,
+        action: 'block',
+      });
+    } catch (syncError) {
+      user.isActive = previousIsActive;
+      await user.save();
+      logger.error('Failed to synchronize TEAM_MEMBER_BLOCKED with auth service', syncError);
+      throw createApiError(502, 'Failed to synchronize block status with auth service');
+    }
+
+    try {
       await teamAccessEventProducer.publishTeamMemberBlocked({
         authId: user.authId,
         email: user.email,
         changedBy: requestedByAuthId,
       });
     } catch (eventError) {
-      user.isActive = previousIsActive;
-      await user.save();
-      logger.error('Failed to publish TEAM_MEMBER_BLOCKED event', eventError);
-      throw createApiError(502, 'Failed to synchronize block status with auth service');
+      logger.warn('Failed to publish TEAM_MEMBER_BLOCKED event after successful direct sync', eventError);
     }
 
     logger.info('Team member blocked successfully', {
@@ -435,16 +563,26 @@ const unblockTeamMember = async ({ authId, requestedByAuthId }) => {
     await user.save();
 
     try {
+      await syncAuthTeamAccessStatus({
+        authId: user.authId,
+        changedBy: requestedByAuthId,
+        action: 'unblock',
+      });
+    } catch (syncError) {
+      user.isActive = previousIsActive;
+      await user.save();
+      logger.error('Failed to synchronize TEAM_MEMBER_UNBLOCKED with auth service', syncError);
+      throw createApiError(502, 'Failed to synchronize unblock status with auth service');
+    }
+
+    try {
       await teamAccessEventProducer.publishTeamMemberUnblocked({
         authId: user.authId,
         email: user.email,
         changedBy: requestedByAuthId,
       });
     } catch (eventError) {
-      user.isActive = previousIsActive;
-      await user.save();
-      logger.error('Failed to publish TEAM_MEMBER_UNBLOCKED event', eventError);
-      throw createApiError(502, 'Failed to synchronize unblock status with auth service');
+      logger.warn('Failed to publish TEAM_MEMBER_UNBLOCKED event after successful direct sync', eventError);
     }
 
     logger.info('Team member unblocked successfully', {
@@ -500,6 +638,7 @@ module.exports = {
   updateUser,
   deleteUser,
   getAllUsers,
+  getPlatformUsers,
   updateLastLogin,
   updateUserRole,
   getTeamAccessData,

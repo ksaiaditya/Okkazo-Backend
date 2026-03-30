@@ -31,6 +31,9 @@ router.use('/api/vendor', extractUser);
 // Get my application - accessible by the vendor
 router.get('/api/vendor/me/application', vendorController.getMyApplication);
 
+// Update my business profile fields (description/location)
+router.patch('/api/vendor/me/application/profile', vendorController.updateMyApplicationProfile);
+
 // Upload/replace profile or banner image
 router.post(
   '/api/vendor/me/application/images/:imageType',
@@ -50,6 +53,13 @@ router.post(
 
 // Vendor: get own services
 router.get('/api/vendor/services/me', vendorController.getMyServices);
+
+// Admin/Manager: get services by vendor authId
+router.get(
+  '/api/vendor/services/vendor/:vendorAuthId',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  vendorController.getVendorServicesByAuthId
+);
 
 // Vendor: update a service
 router.patch(
