@@ -60,6 +60,76 @@ const getOrdersByEventIdForAdmin = async (req, res) => {
   });
 };
 
+const getAdminLedger = async (req, res) => {
+  const result = await paymentService.getAdminLedger(req.query);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const getAdminLedgerTransactionById = async (req, res) => {
+  const result = await paymentService.getAdminLedgerTransactionById(req.params.transactionId);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const getAdminTransactionsByEventIdDetailed = async (req, res) => {
+  const result = await paymentService.getAdminTransactionsByEventIdDetailed(req.params.eventId, req.user);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const getAdminTransactionDetails = async (req, res) => {
+  const result = await paymentService.getAdminTransactionDetails(req.params.transactionId, req.user);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const exportAdminTransactionReceiptPdf = async (req, res) => {
+  const normalizedTransactionId = String(req.params.transactionId || '').trim();
+  const pdfBuffer = await paymentService.exportAdminTransactionReceiptPdf(normalizedTransactionId, req.user);
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="receipt-${normalizedTransactionId || 'transaction'}.pdf"`);
+  res.status(200).send(pdfBuffer);
+};
+
+const exportAdminLedgerCsv = async (req, res) => {
+  const csv = await paymentService.exportAdminLedgerCsv(req.query);
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="admin-ledger-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.status(200).send(csv);
+};
+
+const getAdminReports = async (req, res) => {
+  const result = await paymentService.getAdminReports(req.query);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+};
+
+const exportAdminReportsCsv = async (req, res) => {
+  const csv = await paymentService.exportAdminReportsCsv(req.query);
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="admin-report-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.status(200).send(csv);
+};
+
 const getPaymentSettings = async (req, res) => {
   const result = await paymentSettingsService.getSettings();
 
@@ -86,6 +156,14 @@ module.exports = {
   webhook,
   getOrderByEventId,
   getOrdersByEventIdForAdmin,
+  getAdminLedger,
+  getAdminLedgerTransactionById,
+  getAdminTransactionsByEventIdDetailed,
+  getAdminTransactionDetails,
+  exportAdminTransactionReceiptPdf,
+  exportAdminLedgerCsv,
+  getAdminReports,
+  exportAdminReportsCsv,
   getPaymentSettings,
   updatePaymentSettings,
 };

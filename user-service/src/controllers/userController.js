@@ -304,6 +304,57 @@ const getAllUsers = async (req, res) => {
 };
 
 /**
+ * Get platform users with account status from auth-service
+ * GET /api/users/platform-users
+ */
+const getPlatformUsers = async (req, res) => {
+  try {
+    let { page = 1, limit = 10, role, search } = req.query;
+
+    page = parseInt(page, 10);
+    limit = parseInt(limit, 10);
+
+    if (isNaN(page) || page < 1) {
+      page = 1;
+    }
+
+    if (isNaN(limit) || limit < 1) {
+      limit = 10;
+    }
+
+    if (limit > 100) {
+      limit = 100;
+    }
+
+    const filters = {};
+    if (role) {
+      const validRoles = ['USER', 'VENDOR', 'ADMIN', 'MANAGER'];
+      if (validRoles.includes(role.toUpperCase())) {
+        filters.role = role;
+      }
+    }
+
+    if (search && search.trim() !== '') {
+      filters.search = search.trim();
+    }
+
+    const result = await userService.getPlatformUsers(filters, page, limit);
+
+    res.status(200).json({
+      success: true,
+      data: result.users,
+      pagination: result.pagination,
+    });
+  } catch (error) {
+    logger.error('Error in getPlatformUsers:', error);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
  * Get user statistics
  * GET /api/users/stats
  */
@@ -487,6 +538,7 @@ module.exports = {
   updateUser,
   deleteUser,
   getAllUsers,
+  getPlatformUsers,
   getTeamAccess,
   blockTeamMember,
   unblockTeamMember,

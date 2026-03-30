@@ -52,6 +52,12 @@ router.get(
 );
 
 router.get(
+  '/platform-users',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  userController.getPlatformUsers
+);
+
+router.get(
   '/:id',
   authorizeRoles(['ADMIN', 'MANAGER']),
   userController.getUserById

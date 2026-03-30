@@ -34,6 +34,7 @@
     "kafkajs": "^2.2.4",
     "mongoose": "^8.0.3",
     "morgan": "^1.10.0",
+    "pdfkit": "^0.15.2",
     "razorpay": "^2.9.4",
     "uuid": "^9.0.1",
     "winston": "^3.11.0"

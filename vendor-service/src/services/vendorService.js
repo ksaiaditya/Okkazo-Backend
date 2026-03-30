@@ -253,6 +253,97 @@ const uploadMyApplicationImage = async (authId, imageType, file) => {
 };
 
 /**
+ * Update vendor profile fields for the currently authenticated vendor.
+ * Supports description and location fields used by Business Profile.
+ */
+const updateMyApplicationProfile = async (authId, updates = {}) => {
+  try {
+    if (!authId) {
+      throw new ApiError(401, 'User not authenticated');
+    }
+
+    const application = await VendorApplication.findOne({ authId });
+    if (!application) {
+      throw new ApiError(404, 'No vendor application found for your account');
+    }
+
+    const nextDescription =
+      updates.description != null ? String(updates.description).trim() : undefined;
+
+    const nextLocation =
+      updates.location != null ? String(updates.location).trim() : undefined;
+
+    const nextPlace =
+      updates.place != null ? String(updates.place).trim() : undefined;
+
+    const nextCountry =
+      updates.country != null ? String(updates.country).trim() : undefined;
+
+    const hasLatitude = updates.latitude != null && String(updates.latitude).trim() !== '';
+    const hasLongitude = updates.longitude != null && String(updates.longitude).trim() !== '';
+
+    if (hasLatitude !== hasLongitude) {
+      throw new ApiError(400, 'latitude and longitude must be provided together');
+    }
+
+    if (nextDescription !== undefined) {
+      if (nextDescription.length > 2000) {
+        throw new ApiError(400, 'Description cannot exceed 2000 characters');
+      }
+      application.description = nextDescription || null;
+    }
+
+    if (nextLocation !== undefined) {
+      if (!nextLocation) {
+        throw new ApiError(400, 'location cannot be empty');
+      }
+      if (nextLocation.length > 500) {
+        throw new ApiError(400, 'Location cannot exceed 500 characters');
+      }
+      application.location = nextLocation;
+    }
+
+    if (nextPlace !== undefined) {
+      if (nextPlace.length > 200) {
+        throw new ApiError(400, 'Place cannot exceed 200 characters');
+      }
+      application.place = nextPlace || null;
+    }
+
+    if (nextCountry !== undefined) {
+      if (nextCountry.length > 200) {
+        throw new ApiError(400, 'Country cannot exceed 200 characters');
+      }
+      application.country = nextCountry || null;
+    }
+
+    if (hasLatitude && hasLongitude) {
+      const lat = Number(updates.latitude);
+      const lng = Number(updates.longitude);
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        throw new ApiError(400, 'latitude and longitude must be valid numbers');
+      }
+
+      if (Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+        throw new ApiError(400, 'latitude or longitude out of range');
+      }
+
+      application.latitude = lat;
+      application.longitude = lng;
+    }
+
+    application.lastUpdatedAt = new Date();
+    await application.save();
+
+    return getMyApplication(authId);
+  } catch (error) {
+    logger.error('Error updating my application profile:', error);
+    throw error;
+  }
+};
+
+/**
  * Upload additional document
  */
 const uploadDocument = async (applicationId, documentData) => {
@@ -594,6 +685,7 @@ module.exports = {
   getApplicationStatus,
   getMyApplication,
   uploadMyApplicationImage,
+  updateMyApplicationProfile,
   uploadDocument,
   getAllApplications,
   approveApplication,
