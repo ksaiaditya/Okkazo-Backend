@@ -4,12 +4,15 @@ const UserEventTicket = require('../models/UserEventTicket');
 const axios = require('axios');
 const { CATEGORY, STATUS } = require('../utils/planningConstants');
 const { ADMIN_DECISION_STATUS, PROMOTE_STATUS } = require('../utils/promoteConstants');
-const { USER_TICKET_STATUS } = require('../utils/ticketConstants');
+const { USER_TICKET_STATUS, USER_TICKET_VERIFICATION_STATUS } = require('../utils/ticketConstants');
 const createApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
+const { fetchUserByAuthId } = require('./userServiceClient');
 const { signTicketQrToken, verifyTicketQrToken } = require('../utils/ticketQrToken');
 
 const ORDER_SERVICE_URL = (process.env.ORDER_SERVICE_URL || 'http://order-service:8087').replace(/\/$/, '');
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_SCAN_HISTORY = 200;
 
 const toPositiveInt = (value, fallback) => {
   const n = Number.parseInt(value, 10);
@@ -60,6 +63,160 @@ const normalizeRequestedTiers = (tiers) => {
     .map((tier) => ({ ...tier, quantity: Math.floor(tier.quantity) }));
 };
 
+const normalizePromotionTypes = (promotionType) => {
+  if (!Array.isArray(promotionType)) return [];
+
+  return promotionType
+    .map((promo) => String(promo || '').trim())
+    .filter(Boolean);
+};
+
+const normalizeDayKey = (value) => {
+  if (value == null) return '';
+
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return '';
+    return value.toISOString().slice(0, 10);
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const day = raw.includes('T') ? raw.slice(0, 10) : raw;
+  return DAY_KEY_RE.test(day) ? day : '';
+};
+
+const resolveSelectedDayFromSchedule = (schedule) => normalizeDayKey(schedule?.startAt);
+
+const resolveTicketSelectedDay = ({ selectedDay, schedule } = {}) => {
+  const explicit = normalizeDayKey(selectedDay);
+  if (explicit) return explicit;
+  return resolveSelectedDayFromSchedule(schedule) || null;
+};
+
+const appendTicketScanHistory = (existing, entry) => {
+  const rows = Array.isArray(existing) ? [...existing] : [];
+  rows.push(entry);
+  if (rows.length > MAX_SCAN_HISTORY) {
+    return rows.slice(rows.length - MAX_SCAN_HISTORY);
+  }
+  return rows;
+};
+
+const mapScanHistoryForApi = (scanHistory) => {
+  if (!Array.isArray(scanHistory)) return [];
+  return scanHistory
+    .map((row) => {
+      const scannedAt = row?.scannedAt ? new Date(row.scannedAt) : null;
+      return {
+        scannedAt: scannedAt && !Number.isNaN(scannedAt.getTime()) ? scannedAt.toISOString() : null,
+        scannedByAuthId: String(row?.scannedByAuthId || '').trim() || null,
+        scannedByRole: String(row?.scannedByRole || '').trim() || null,
+        outcome: String(row?.outcome || '').trim() || null,
+      };
+    })
+    .filter((row) => row.scannedAt && row.outcome);
+};
+
+const toDisplayTicketStatus = (ticket) => {
+  const ticketStatus = String(ticket?.ticketStatus || '').trim().toUpperCase();
+  const verificationStatus = String(ticket?.verification?.status || '').trim().toUpperCase();
+
+  if (ticketStatus === USER_TICKET_STATUS.SUCCESS) {
+    if (verificationStatus === USER_TICKET_VERIFICATION_STATUS.VERIFIED) {
+      return 'Checked In';
+    }
+    return 'Confirmed';
+  }
+
+  if (ticketStatus === USER_TICKET_STATUS.CANCELED || ticketStatus === USER_TICKET_STATUS.EXPIRED) {
+    return 'Cancelled';
+  }
+
+  return 'Pending';
+};
+
+const resolveTicketTypeLabel = (ticket) => {
+  const tiers = Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [];
+  const tierNames = tiers
+    .map((tier) => String(tier?.name || '').trim())
+    .filter(Boolean);
+
+  if (tierNames.length > 0) {
+    return tierNames.join(', ');
+  }
+
+  const ticketType = String(ticket?.tickets?.ticketType || '').trim().toLowerCase();
+  if (ticketType === 'free') return 'General Admission';
+  return 'Ticket';
+};
+
+const normalizeGuestName = (user, authId) => {
+  const candidates = [
+    user?.name,
+    user?.fullName,
+    user?.username,
+  ];
+
+  for (const value of candidates) {
+    const text = String(value || '').trim();
+    if (text) return text;
+  }
+
+  const suffix = String(authId || '').trim();
+  if (!suffix) return 'Guest';
+  return `Guest ${suffix.slice(0, 6)}`;
+};
+
+const normalizeGuestEmail = (user) => {
+  const email = String(user?.email || user?.mail || '').trim();
+  return email || null;
+};
+
+const normalizePlanningDayWiseAllocations = ({ tickets, tiers } = {}) => {
+  const rows = Array.isArray(tickets?.dayWiseAllocations) ? tickets.dayWiseAllocations : [];
+  if (rows.length === 0) return [];
+
+  const priceByTierName = new Map(
+    (Array.isArray(tiers) ? tiers : [])
+      .map((tier) => [normalizeTierNameKey(tier?.name), Number(tier?.price || 0)])
+      .filter(([name]) => Boolean(name))
+  );
+
+  return rows
+    .map((row) => {
+      const day = normalizeDayKey(row?.day);
+      if (!day) return null;
+
+      const ticketCountRaw = Number(row?.ticketCount || 0);
+      const ticketCount = Number.isFinite(ticketCountRaw) && ticketCountRaw > 0 ? ticketCountRaw : 0;
+
+      const tierBreakdown = (Array.isArray(row?.tierBreakdown) ? row.tierBreakdown : [])
+        .map((tierRow) => {
+          const name = String(tierRow?.tierName || tierRow?.name || '').trim();
+          if (!name) return null;
+
+          const availableRaw = Number(tierRow?.ticketCount || tierRow?.quantity || 0);
+          const available = Number.isFinite(availableRaw) && availableRaw > 0 ? availableRaw : 0;
+          const price = Number(priceByTierName.get(normalizeTierNameKey(name)) || 0);
+
+          return {
+            name,
+            available,
+            price,
+          };
+        })
+        .filter((tier) => tier && tier.available > 0);
+
+      return {
+        day,
+        ticketCount,
+        tierBreakdown,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => String(a.day).localeCompare(String(b.day)));
+};
+
 const ensureTicketSalesWindow = (ticketAvailability) => {
   const now = new Date();
   const startAt = ticketAvailability?.startAt ? new Date(ticketAvailability.startAt) : null;
@@ -90,24 +247,32 @@ const resolveEventForPurchase = async (eventId) => {
     eventId: trimmedEventId,
     category: CATEGORY.PUBLIC,
     platformFeePaid: true,
-    status: { $nin: [STATUS.PAYMENT_PENDING, STATUS.REJECTED, STATUS.COMPLETED] },
+    status: STATUS.CONFIRMED,
     'ticketAvailability.startAt': { $lte: now },
     'ticketAvailability.endAt': { $gte: now },
   }).lean();
 
   if (planning) {
+    const planningTiers = (Array.isArray(planning?.tickets?.tiers) ? planning.tickets.tiers : [])
+      .map((tier) => ({
+        name: String(tier?.tierName || '').trim(),
+        available: Number(tier?.ticketCount || 0),
+        price: Number(tier?.ticketPrice || 0),
+      }))
+      .filter((tier) => tier.name && tier.available > 0);
+
+    const planningDayWiseAllocations = normalizePlanningDayWiseAllocations({
+      tickets: planning?.tickets,
+      tiers: planningTiers,
+    });
+
     return {
       source: 'planning-public',
       event: planning,
       ticketType: String(planning?.tickets?.ticketType || 'free').toLowerCase() === 'paid' ? 'paid' : 'free',
       totalAvailable: Number(planning?.tickets?.totalTickets || 0),
-      tiers: (Array.isArray(planning?.tickets?.tiers) ? planning.tickets.tiers : [])
-        .map((tier) => ({
-          name: String(tier?.tierName || '').trim(),
-          available: Number(tier?.ticketCount || 0),
-          price: Number(tier?.ticketPrice || 0),
-        }))
-        .filter((tier) => tier.name && tier.available > 0),
+      tiers: planningTiers,
+      dayWiseAllocations: planningDayWiseAllocations,
       venue: {
         locationName: planning?.location?.name || 'TBA',
         latitude: planning?.location?.latitude ?? null,
@@ -119,6 +284,7 @@ const resolveEventForPurchase = async (eventId) => {
       eventDescription: planning?.eventDescription || '',
       eventField: planning?.eventField || null,
       eventBanner: planning?.eventBanner || null,
+      selectedPromotions: normalizePromotionTypes(planning?.promotionType),
     };
   }
 
@@ -161,20 +327,64 @@ const resolveEventForPurchase = async (eventId) => {
   throw createApiError(404, 'Ticket event not found or not available for sale');
 };
 
-const computeSelection = ({ ticketType, totalAvailable, tiers, requestedTiers }) => {
+const computeSelection = ({ ticketType, totalAvailable, tiers, requestedTiers, selectedDay, dayWiseAllocations }) => {
   const normalizedRequested = normalizeRequestedTiers(requestedTiers);
   if (!normalizedRequested.length) {
     throw createApiError(400, 'Select at least one ticket tier with quantity');
   }
 
   const normalizedType = String(ticketType || '').trim().toLowerCase();
-  const effectiveTiers = Array.isArray(tiers) ? tiers : [];
+  const baseTiers = Array.isArray(tiers) ? tiers : [];
+  const dayRows = Array.isArray(dayWiseAllocations) ? dayWiseAllocations : [];
+
+  const normalizedSelectedDay = normalizeDayKey(selectedDay);
+
+  let effectiveTotalAvailable = Number(totalAvailable || 0);
+  let effectiveTiers = [...baseTiers];
+
+  if (dayRows.length > 0) {
+    if (!normalizedSelectedDay) {
+      throw createApiError(400, 'Please select an event date before booking tickets');
+    }
+
+    const selectedDayRow = dayRows.find((row) => normalizeDayKey(row?.day) === normalizedSelectedDay);
+    if (!selectedDayRow) {
+      throw createApiError(400, 'Selected date is not available for ticket booking');
+    }
+
+    effectiveTotalAvailable = Number(selectedDayRow?.ticketCount || 0);
+
+    if (Array.isArray(selectedDayRow?.tierBreakdown) && selectedDayRow.tierBreakdown.length > 0) {
+      const priceByTierName = new Map(
+        baseTiers
+          .map((tier) => [normalizeTierNameKey(tier?.name), Number(tier?.price || 0)])
+          .filter(([name]) => Boolean(name))
+      );
+
+      effectiveTiers = selectedDayRow.tierBreakdown
+        .map((tier) => {
+          const name = String(tier?.name || tier?.tierName || '').trim();
+          if (!name) return null;
+
+          const availableRaw = Number(tier?.available ?? tier?.ticketCount ?? tier?.quantity ?? 0);
+          const available = Number.isFinite(availableRaw) && availableRaw > 0 ? availableRaw : 0;
+          const price = Number(priceByTierName.get(normalizeTierNameKey(name)) || tier?.price || 0);
+
+          return {
+            name,
+            available,
+            price,
+          };
+        })
+        .filter((tier) => tier && tier.name && tier.available > 0);
+    }
+  }
 
   // Free events can be configured without explicit tiers in DB.
   // In that case, treat requests as selecting the implicit "General" tier.
   const tiersForMatching =
     normalizedType === 'free' && effectiveTiers.length === 0
-      ? [{ name: 'General', available: Number(totalAvailable || 0), price: 0 }]
+      ? [{ name: 'General', available: Number(effectiveTotalAvailable || 0), price: 0 }]
       : effectiveTiers;
 
   const tierMap = new Map();
@@ -219,7 +429,7 @@ const computeSelection = ({ ticketType, totalAvailable, tiers, requestedTiers })
     throw createApiError(400, 'Ticket quantity must be at least 1');
   }
 
-  if (totalQuantity > Number(totalAvailable || 0)) {
+  if (totalQuantity > Number(effectiveTotalAvailable || 0)) {
     throw createApiError(409, 'Not enough tickets available for this event');
   }
 
@@ -227,11 +437,26 @@ const computeSelection = ({ ticketType, totalAvailable, tiers, requestedTiers })
     selectedTiers,
     totalQuantity,
     totalAmountInPaise,
+    selectedDay: normalizedSelectedDay || null,
   };
 };
 
 const mapTicketForFrontend = (ticket) => {
   if (!ticket) return null;
+
+  const verificationStatus = String(ticket?.verification?.status || '').trim().toUpperCase() === USER_TICKET_VERIFICATION_STATUS.VERIFIED
+    ? USER_TICKET_VERIFICATION_STATUS.VERIFIED
+    : USER_TICKET_VERIFICATION_STATUS.PENDING;
+
+  const selectedDay = resolveTicketSelectedDay({
+    selectedDay: ticket?.tickets?.selectedDay,
+    schedule: ticket?.schedule,
+  });
+
+  const normalizedTickets = {
+    ...(ticket?.tickets || {}),
+    selectedDay: selectedDay || null,
+  };
 
   const qrToken = signTicketQrToken({
     ticketId: ticket.ticketId,
@@ -250,9 +475,18 @@ const mapTicketForFrontend = (ticket) => {
     venue: ticket.venue,
     schedule: ticket.schedule,
     ticketAvailability: ticket.ticketAvailability,
-    tickets: ticket.tickets,
+    tickets: normalizedTickets,
+    selectedDay,
     isPaid: Boolean(ticket.isPaid),
     ticketStatus: ticket.ticketStatus,
+    verification: {
+      status: verificationStatus,
+      verifiedAt: ticket?.verification?.verifiedAt || null,
+      verifiedByAuthId: ticket?.verification?.verifiedByAuthId || null,
+      lastScannedAt: ticket?.verification?.lastScannedAt || null,
+      scanCount: Number(ticket?.verification?.scanCount || 0),
+      scanHistory: mapScanHistoryForApi(ticket?.verification?.scanHistory),
+    },
     paidAt: ticket.paidAt,
     createdAt: ticket.createdAt,
     qrToken,
@@ -274,10 +508,16 @@ const normalizePlanningTickets = (tickets) => {
       .filter((tier) => tier.name && tier.noOfTickets > 0)
     : [];
 
+  const dayWiseAllocations = normalizePlanningDayWiseAllocations({
+    tickets,
+    tiers,
+  });
+
   return {
     noOfTickets,
     ticketType,
     tiers,
+    dayWiseAllocations,
   };
 };
 
@@ -326,6 +566,7 @@ const mapPlanningEvent = (event, soldCount = 0) => {
   trendingScore,
   eventField: event?.eventField || null,
   eventBanner: event?.eventBanner || null,
+  selectedPromotions: normalizePromotionTypes(event?.promotionType),
   };
 };
 
@@ -367,7 +608,7 @@ const getTicketMarketplaceEvents = async ({ page = 1, limit = 20 } = {}) => {
   const planningQuery = {
     category: CATEGORY.PUBLIC,
     platformFeePaid: true,
-    status: { $nin: [STATUS.PAYMENT_PENDING, STATUS.REJECTED, STATUS.COMPLETED] },
+    status: STATUS.CONFIRMED,
     'ticketAvailability.startAt': { $lte: now },
     'ticketAvailability.endAt': { $gte: now },
   };
@@ -390,6 +631,7 @@ const getTicketMarketplaceEvents = async ({ page = 1, limit = 20 } = {}) => {
     'schedule',
     'ticketAvailability',
     'tickets',
+    'promotionType',
     'updatedAt',
   ].join(' ');
 
@@ -503,7 +745,7 @@ const getMyTicketInterests = async ({ userAuthId } = {}) => {
   };
 };
 
-const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers } = {}) => {
+const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers, selectedDay } = {}) => {
   const authId = String(userAuthId || '').trim();
   if (!authId) {
     throw createApiError(401, 'Authentication required');
@@ -512,11 +754,18 @@ const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers } = {}
   const resolved = await resolveEventForPurchase(eventId);
   ensureTicketSalesWindow(resolved.ticketAvailability);
 
-  const { selectedTiers, totalQuantity, totalAmountInPaise } = computeSelection({
+  const { selectedTiers, totalQuantity, totalAmountInPaise, selectedDay: normalizedSelectedDay } = computeSelection({
     ticketType: resolved.ticketType,
     totalAvailable: resolved.totalAvailable,
     tiers: resolved.tiers,
     requestedTiers: tiers,
+    selectedDay,
+    dayWiseAllocations: resolved.dayWiseAllocations,
+  });
+
+  const finalSelectedDay = resolveTicketSelectedDay({
+    selectedDay: normalizedSelectedDay,
+    schedule: resolved.schedule,
   });
 
   if (resolved.ticketType === 'paid' && totalAmountInPaise <= 0) {
@@ -572,6 +821,7 @@ const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers } = {}
       noOfTickets: totalQuantity,
       ticketType: resolved.ticketType,
       tiers: selectedTiers,
+      selectedDay: finalSelectedDay,
       unitPrice: avgUnitPrice,
       totalAmount: Number((subtotalInPaise / 100).toFixed(2)),
       currency: 'INR',
@@ -595,6 +845,7 @@ const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers } = {}
         noOfTickets: totalQuantity,
         ticketType: resolved.ticketType,
         tiers: selectedTiers,
+        selectedDay: finalSelectedDay,
         unitPrice: avgUnitPrice,
         totalAmount: Number((subtotalInPaise / 100).toFixed(2)),
         currency: 'INR',
@@ -615,6 +866,10 @@ const prepareTicketPurchase = async ({ eventId, userAuthId, userId, tiers } = {}
     eventLocation: ticket?.venue?.locationName || 'TBA',
     ticketType: ticket?.tickets?.ticketType,
     tiers: ticket?.tickets?.tiers || [],
+    selectedDay: resolveTicketSelectedDay({
+      selectedDay: ticket?.tickets?.selectedDay,
+      schedule: ticket?.schedule,
+    }) || null,
     quantity: ticket?.tickets?.noOfTickets || 0,
     subtotalInPaise,
     subtotalInInr: Number((subtotalInPaise / 100).toFixed(2)),
@@ -702,14 +957,14 @@ const confirmFreeTicketPurchase = async ({ eventId, ticketId, userAuthId } = {})
   return confirmed;
 };
 
-const verifyTicketQr = async ({ token } = {}) => {
+const verifyTicketQr = async ({ token, scannedByAuthId, scannedByRole } = {}) => {
   const payload = verifyTicketQrToken(token);
 
   const ticket = await UserEventTicket.findOne({
     ticketId: String(payload.ticketId).trim(),
     eventId: String(payload.eventId).trim(),
     userAuthId: String(payload.userAuthId).trim(),
-  }).lean();
+  });
 
   if (!ticket) {
     throw createApiError(404, 'Ticket not found for this QR token');
@@ -718,20 +973,131 @@ const verifyTicketQr = async ({ token } = {}) => {
   const isPaid = Boolean(ticket?.isPaid);
   const ticketStatus = String(ticket?.ticketStatus || '').trim().toUpperCase();
   if (!isPaid || ticketStatus !== USER_TICKET_STATUS.SUCCESS) {
+    if (!isPaid || ticketStatus === USER_TICKET_STATUS.PAYMENT_REQUIRED) {
+      throw createApiError(409, 'Ticket payment is pending');
+    }
+    if (ticketStatus === USER_TICKET_STATUS.CANCELED) {
+      throw createApiError(409, 'Ticket is canceled and cannot be used for entry');
+    }
+    if (ticketStatus === USER_TICKET_STATUS.EXPIRED) {
+      throw createApiError(409, 'Ticket has expired');
+    }
     throw createApiError(409, 'Ticket is not valid for entry');
   }
 
+  const now = new Date();
+
+  const startAt = ticket?.schedule?.startAt ? new Date(ticket.schedule.startAt) : null;
+  if (startAt && !Number.isNaN(startAt.getTime()) && now < startAt) {
+    throw createApiError(409, 'Event check-in has not started yet');
+  }
+
+  const endAt = ticket?.schedule?.endAt ? new Date(ticket.schedule.endAt) : null;
+  if (endAt && !Number.isNaN(endAt.getTime()) && now > endAt) {
+    throw createApiError(409, 'Event has ended and check-in is closed');
+  }
+
+  const verificationStatus = String(ticket?.verification?.status || '').trim().toUpperCase() === USER_TICKET_VERIFICATION_STATUS.VERIFIED
+    ? USER_TICKET_VERIFICATION_STATUS.VERIFIED
+    : USER_TICKET_VERIFICATION_STATUS.PENDING;
+
+  const previousScanCount = Number(ticket?.verification?.scanCount || 0);
+  const scannerAuthId = String(scannedByAuthId || '').trim() || null;
+  const scannerRole = String(scannedByRole || '').trim().toUpperCase() || null;
+  const selectedDay = resolveTicketSelectedDay({
+    selectedDay: ticket?.tickets?.selectedDay,
+    schedule: ticket?.schedule,
+  });
+
+  if (!ticket.tickets) ticket.tickets = {};
+  if (selectedDay && ticket?.tickets?.selectedDay !== selectedDay) {
+    ticket.tickets.selectedDay = selectedDay;
+  }
+
+  if (verificationStatus === USER_TICKET_VERIFICATION_STATUS.VERIFIED) {
+    const scanHistory = appendTicketScanHistory(ticket?.verification?.scanHistory, {
+      scannedAt: now,
+      scannedByAuthId: scannerAuthId,
+      scannedByRole: scannerRole,
+      outcome: 'ALREADY_SCANNED',
+    });
+
+    ticket.verification = {
+      ...(ticket.verification?.toObject ? ticket.verification.toObject() : ticket.verification || {}),
+      status: USER_TICKET_VERIFICATION_STATUS.VERIFIED,
+      verifiedAt: ticket?.verification?.verifiedAt || now,
+      verifiedByAuthId: ticket?.verification?.verifiedByAuthId || scannerAuthId,
+      lastScannedAt: now,
+      scanCount: previousScanCount + 1,
+      scanHistory,
+    };
+
+    await ticket.save({ validateBeforeSave: false });
+
+    return {
+      valid: true,
+      alreadyScanned: true,
+      message: "It's already scanned",
+      ticketId: ticket.ticketId,
+      eventId: ticket.eventId,
+      userAuthId: ticket.userAuthId,
+      eventTitle: ticket.eventTitle,
+      eventSource: ticket.eventSource,
+      ticketStatus: ticket.ticketStatus,
+      verificationStatus: USER_TICKET_VERIFICATION_STATUS.VERIFIED,
+      quantity: Number(ticket?.tickets?.noOfTickets || 0),
+      tiers: Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [],
+      selectedDay: ticket?.tickets?.selectedDay || selectedDay || null,
+      paidAt: ticket.paidAt || null,
+      verifiedAt: ticket?.verification?.verifiedAt || null,
+      lastScannedAt: now.toISOString(),
+      scanCount: previousScanCount + 1,
+      scannedByAuthId: ticket?.verification?.verifiedByAuthId || null,
+      scannedByRole: scannerRole,
+      scanHistory: mapScanHistoryForApi(scanHistory),
+    };
+  }
+
+  const scanHistory = appendTicketScanHistory(ticket?.verification?.scanHistory, {
+    scannedAt: now,
+    scannedByAuthId: scannerAuthId,
+    scannedByRole: scannerRole,
+    outcome: 'VERIFIED',
+  });
+
+  ticket.verification = {
+    ...(ticket.verification?.toObject ? ticket.verification.toObject() : ticket.verification || {}),
+    status: USER_TICKET_VERIFICATION_STATUS.VERIFIED,
+    verifiedAt: now,
+    verifiedByAuthId: scannerAuthId,
+    lastScannedAt: now,
+    scanCount: previousScanCount + 1,
+    scanHistory,
+  };
+
+  await ticket.save({ validateBeforeSave: false });
+
   return {
     valid: true,
+    alreadyScanned: false,
+    message: 'Ticket verified successfully',
     ticketId: ticket.ticketId,
     eventId: ticket.eventId,
+    userAuthId: ticket.userAuthId,
     eventTitle: ticket.eventTitle,
     eventSource: ticket.eventSource,
     ticketStatus: ticket.ticketStatus,
+    verificationStatus: USER_TICKET_VERIFICATION_STATUS.VERIFIED,
     quantity: Number(ticket?.tickets?.noOfTickets || 0),
     tiers: Array.isArray(ticket?.tickets?.tiers) ? ticket.tickets.tiers : [],
+    selectedDay: ticket?.tickets?.selectedDay || selectedDay || null,
     paidAt: ticket.paidAt || null,
-    scannedAt: new Date().toISOString(),
+    verifiedAt: now.toISOString(),
+    lastScannedAt: now.toISOString(),
+    scanCount: previousScanCount + 1,
+    scannedByAuthId: scannerAuthId,
+    scannedByRole: scannerRole,
+    scanHistory: mapScanHistoryForApi(scanHistory),
   };
 };
 
@@ -841,6 +1207,110 @@ const getMyTickets = async ({ userAuthId } = {}) => {
   };
 };
 
+const getEventTicketGuests = async ({ eventId, page = 1, limit = 20, query = '' } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const normalizedPage = toPositiveInt(page, 1);
+  const normalizedLimit = Math.min(100, toPositiveInt(limit, 20));
+  const normalizedQuery = String(query || '').trim().toLowerCase();
+
+  const rows = await UserEventTicket.find({ eventId: normalizedEventId })
+    .sort({ paidAt: -1, createdAt: -1 })
+    .lean();
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      guests: [],
+      total: 0,
+      page: normalizedPage,
+      limit: normalizedLimit,
+      totalPages: 0,
+    };
+  }
+
+  const uniqueAuthIds = Array.from(
+    new Set(
+      rows
+        .map((row) => String(row?.userAuthId || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  const userByAuthId = new Map();
+  await Promise.all(uniqueAuthIds.map(async (authId) => {
+    try {
+      const user = await fetchUserByAuthId(authId);
+      if (user) userByAuthId.set(authId, user);
+    } catch (error) {
+      logger.warn('Failed to resolve guest user from user-service', {
+        authId,
+        eventId: normalizedEventId,
+        message: error?.response?.data?.message || error?.message,
+      });
+    }
+  }));
+
+  const mapped = rows.map((ticket) => {
+    const userAuthId = String(ticket?.userAuthId || '').trim();
+    const user = userByAuthId.get(userAuthId) || null;
+
+    const quantityRaw = Number(ticket?.tickets?.noOfTickets || 0);
+    const quantity = Number.isFinite(quantityRaw) && quantityRaw > 0 ? quantityRaw : 0;
+
+    const paidAmountRaw = Number(ticket?.tickets?.totalAmount || 0);
+    const paidAmount = Number.isFinite(paidAmountRaw) && paidAmountRaw >= 0 ? paidAmountRaw : 0;
+
+    return {
+      ticketId: String(ticket?.ticketId || '').trim() || null,
+      userAuthId,
+      registrant: {
+        name: normalizeGuestName(user, userAuthId),
+        email: normalizeGuestEmail(user),
+      },
+      ticketType: resolveTicketTypeLabel(ticket),
+      quantity,
+      status: toDisplayTicketStatus(ticket),
+      paidAmount,
+      currency: String(ticket?.tickets?.currency || 'INR').trim() || 'INR',
+      paidAt: ticket?.paidAt || null,
+      createdAt: ticket?.createdAt || null,
+    };
+  });
+
+  const filtered = normalizedQuery
+    ? mapped.filter((row) => {
+      const haystack = [
+        row?.registrant?.name,
+        row?.registrant?.email,
+        row?.ticketType,
+        row?.ticketId,
+        row?.status,
+      ]
+        .map((value) => String(value || '').toLowerCase())
+        .join(' ');
+
+      return haystack.includes(normalizedQuery);
+    })
+    : mapped;
+
+  const total = filtered.length;
+  const totalPages = total === 0 ? 0 : Math.ceil(total / normalizedLimit);
+  const safePage = totalPages === 0 ? 1 : Math.min(normalizedPage, totalPages);
+  const start = (safePage - 1) * normalizedLimit;
+  const guests = filtered.slice(start, start + normalizedLimit);
+
+  return {
+    guests,
+    total,
+    page: safePage,
+    limit: normalizedLimit,
+    totalPages,
+  };
+};
+
 const markTicketSalePaid = async (payload = {}) => {
   const eventId = String(payload?.eventId || '').trim();
   const authId = String(payload?.authId || '').trim();
@@ -934,6 +1404,78 @@ const markTicketSalePaid = async (payload = {}) => {
       }
     }
 
+    const selectedDay = normalizeDayKey(ticket?.tickets?.selectedDay);
+    if (selectedDay && Array.isArray(planning?.tickets?.dayWiseAllocations) && planning.tickets.dayWiseAllocations.length > 0) {
+      const dayIndex = planning.tickets.dayWiseAllocations.findIndex(
+        (row) => normalizeDayKey(row?.day) === selectedDay
+      );
+
+      if (dayIndex < 0) {
+        logger.error('Planning day allocation missing during payment confirmation', { eventId, ticketId, selectedDay });
+        ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+        await ticket.save();
+        return null;
+      }
+
+      const dayAvailable = Number(planning.tickets.dayWiseAllocations[dayIndex]?.ticketCount || 0);
+      if (dayAvailable < requestedTotal) {
+        logger.error('Insufficient planning day inventory during payment confirmation', {
+          eventId,
+          ticketId,
+          selectedDay,
+          requestedTotal,
+          dayAvailable,
+        });
+        ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+        await ticket.save();
+        return null;
+      }
+
+      planning.tickets.dayWiseAllocations[dayIndex].ticketCount = dayAvailable - requestedTotal;
+
+      const dayTiers = Array.isArray(planning.tickets.dayWiseAllocations[dayIndex]?.tierBreakdown)
+        ? planning.tickets.dayWiseAllocations[dayIndex].tierBreakdown
+        : [];
+
+      if (dayTiers.length > 0) {
+        for (const selectedTier of selectedTiers) {
+          const tierIndex = dayTiers.findIndex(
+            (tier) => normalizeTierNameKey(tier?.tierName || tier?.name) === normalizeTierNameKey(selectedTier?.name)
+          );
+
+          if (tierIndex < 0) {
+            logger.error('Planning day tier missing during payment confirmation', {
+              eventId,
+              ticketId,
+              selectedDay,
+              tier: selectedTier?.name,
+            });
+            ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+            await ticket.save();
+            return null;
+          }
+
+          const dayTierAvailable = Number(dayTiers[tierIndex]?.ticketCount || 0);
+          const dayTierRequested = Number(selectedTier?.noOfTickets || 0);
+          if (dayTierAvailable < dayTierRequested) {
+            logger.error('Insufficient planning day tier inventory during payment confirmation', {
+              eventId,
+              ticketId,
+              selectedDay,
+              tier: selectedTier?.name,
+              requested: dayTierRequested,
+              available: dayTierAvailable,
+            });
+            ticket.ticketStatus = USER_TICKET_STATUS.CANCELED;
+            await ticket.save();
+            return null;
+          }
+
+          dayTiers[tierIndex].ticketCount = dayTierAvailable - dayTierRequested;
+        }
+      }
+    }
+
     await planning.save({ validateBeforeSave: false });
   } else if (ticket.eventSource === 'promote') {
     const promote = await Promote.findOne({ eventId });
@@ -1015,6 +1557,7 @@ module.exports = {
   confirmFreeTicketPurchase,
   getMyTickets,
   getMyTicketByTicketId,
+  getEventTicketGuests,
   markTicketSalePaid,
   verifyTicketQr,
 };

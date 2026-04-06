@@ -99,6 +99,20 @@ router.delete(
   promoteController.removePromoteCoreStaff
 );
 
+// PATCH /promote/:eventId/generated-revenue-payout - Release generated revenue to user (demo)
+router.patch(
+  '/promote/:eventId/generated-revenue-payout',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  promoteController.releasePromoteGeneratedRevenuePayout
+);
+
+// POST /promote/:eventId/promotion-actions/email-blast - Trigger email blast promotion
+router.post(
+  '/promote/:eventId/promotion-actions/email-blast',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  promoteController.triggerPromoteEmailBlastPromotionAction
+);
+
 // PATCH /promote/:eventId/status — Update event status (Manager/Admin)
 router.patch(
   '/promote/:eventId/status',

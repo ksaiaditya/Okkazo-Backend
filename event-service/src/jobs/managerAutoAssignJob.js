@@ -2,7 +2,7 @@ const Promote = require('../models/Promote');
 const Planning = require('../models/Planning');
 const logger = require('../utils/logger');
 const { fetchActiveManagers } = require('../services/userServiceClient');
-const { CATEGORY, STATUS } = require('../utils/planningConstants');
+const { CATEGORY, TERMINAL_STATUSES } = require('../utils/planningConstants');
 const { PROMOTE_STATUS } = require('../utils/promoteConstants');
 const { getState: getManagerAutoAssignState } = require('./managerAutoAssignRuntimeConfig');
 const vendorSelectionService = require('../services/vendorSelectionService');
@@ -27,7 +27,7 @@ const promoteCandidateFilter = {
 
 const planningCandidateFilter = {
   assignedManagerId: null,
-  status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+  status: { $nin: TERMINAL_STATUSES },
   $or: [{ vendorSelectionId: { $ne: null } }, { platformFeePaid: true }, { isPaid: true }],
 };
 
@@ -98,7 +98,7 @@ const isManagerAvailableForDay = async ({ managerId, dayStart, dayEnd, excludeEv
 
   const planningQuery = {
     assignedManagerId: managerId,
-    status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+    status: { $nin: TERMINAL_STATUSES },
     ...(excludeEventId ? { eventId: { $ne: String(excludeEventId).trim() } } : {}),
     $or: [
       { eventDate: { $gte: dayStart, $lt: dayEnd } },
@@ -278,7 +278,7 @@ const runOnce = async () => {
             {
               eventId: String(candidate.eventId).trim(),
               assignedManagerId: null,
-              status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+              status: { $nin: TERMINAL_STATUSES },
               $or: [{ vendorSelectionId: { $ne: null } }, { platformFeePaid: true }, { isPaid: true }],
             },
             {

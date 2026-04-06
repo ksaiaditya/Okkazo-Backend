@@ -75,6 +75,12 @@ const VendorItemSchema = new mongoose.Schema(
       min: 0,
       default: null,
     },
+    priceHikeReason: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 500,
+    },
     priceLocked: {
       type: Boolean,
       default: false,
@@ -287,6 +293,11 @@ VendorSelectionSchema.pre('validate', function preValidate(next) {
       v.commissionAmount = Number.isFinite(amt) && amt >= 0 ? amt : null;
     }
 
+    if (v.priceHikeReason != null) {
+      const reason = String(v.priceHikeReason || '').trim();
+      v.priceHikeReason = reason || null;
+    }
+
     if (v.priceLocked && !v.vendorQuotedPrice) {
       v.priceLocked = false;
     }
@@ -311,6 +322,7 @@ VendorSelectionSchema.pre('validate', function preValidate(next) {
       v.vendorQuotedPrice = null;
       v.commissionPercent = null;
       v.commissionAmount = null;
+      v.priceHikeReason = null;
     }
 
     if (v.pricingQuantity != null) {

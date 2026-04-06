@@ -46,21 +46,57 @@ const normalizeRazorpayError = (err, options = {}) => {
   const defaultStatusCode = options.defaultStatusCode || 422;
   const defaultMessage = options.defaultMessage || 'Payment provider error';
 
-  const statusCode = Number(err?.statusCode) || Number(err?.error?.statusCode) || defaultStatusCode;
+  const responseStatus = Number(err?.response?.status);
+  const responseData = err?.response?.data;
+  const responseError = responseData?.error && typeof responseData.error === 'object'
+    ? responseData.error
+    : null;
+
+  const statusCode =
+    (Number.isFinite(responseStatus) ? responseStatus : null)
+    || Number(err?.statusCode)
+    || Number(err?.error?.statusCode)
+    || defaultStatusCode;
 
   const description =
+    responseError?.description ||
+    responseError?.reason ||
+    responseError?.message ||
+    responseData?.message ||
     err?.error?.description ||
     err?.error?.message ||
     err?.message ||
     '';
 
-  const code = err?.error?.code || err?.code;
+  const code =
+    responseError?.code ||
+    responseData?.code ||
+    err?.error?.code ||
+    err?.code;
   const message = [description, code ? `(${safeString(code)})` : ''].filter(Boolean).join(' ');
 
-  return createApiError(
-    Number.isFinite(statusCode) ? statusCode : defaultStatusCode,
-    message || defaultMessage
+  const normalizedDescription = String(description || '').trim();
+  const isRouteNotEnabled = /route feature not enabled/i.test(normalizedDescription);
+
+  const finalStatusCode = isRouteNotEnabled
+    ? 409
+    : (Number.isFinite(statusCode) ? statusCode : defaultStatusCode);
+
+  const finalMessage = isRouteNotEnabled
+    ? 'Razorpay Route is not enabled for this merchant account. Please enable Route in Razorpay before using vendor payouts.'
+    : (message || defaultMessage);
+
+  const normalized = createApiError(
+    finalStatusCode,
+    finalMessage
   );
+
+  normalized.razorpay = {
+    statusCode: Number.isFinite(statusCode) ? statusCode : defaultStatusCode,
+    error: responseError || err?.error || null,
+  };
+
+  return normalized;
 };
 
 const getErrorLogMeta = (err) => {

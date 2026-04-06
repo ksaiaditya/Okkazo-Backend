@@ -19,11 +19,21 @@ const defaultVendorServiceUrl = process.env.SERVICE_HOST
   ? 'http://vendor-service:8084' // docker-compose service name
   : 'http://localhost:8084';
 const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceUrl;
+const defaultOrderServiceUrl = process.env.SERVICE_HOST
+  ? 'http://order-service:8087'
+  : 'http://localhost:8087';
+const orderServiceUrl = process.env.ORDER_SERVICE_URL || defaultOrderServiceUrl;
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
 const HOLD_REPAIR_WINDOW_MS = Math.max(
   60 * 1000,
   Number(process.env.VENDOR_RESERVATION_HOLD_TTL_MS || 10 * 60 * 1000)
 );
+const STICKY_PLANNING_STATUSES = new Set([
+  PLANNING_STATUS.CONFIRMED,
+  PLANNING_STATUS.COMPLETED,
+  PLANNING_STATUS.VENDOR_PAYMENT_PENDING,
+  PLANNING_STATUS.CLOSED,
+]);
 
 // Keep alternatives scoped to a reasonable distance from event location.
 const ALTERNATIVES_RADIUS_KM = 120;
@@ -59,6 +69,58 @@ const formatDistance = (km) => {
   if (n == null) return null;
   if (n < 1) return `${Math.round(n * 1000)} m`;
   return `${n.toFixed(1)} km`;
+};
+
+const buildInternalOrderServiceHeaders = (user = {}) => ({
+  'x-auth-id': String(user?.authId || 'event-service').trim() || 'event-service',
+  'x-user-id': String(user?.userId || '').trim(),
+  'x-user-email': String(user?.email || '').trim(),
+  'x-user-username': String(user?.username || 'event-service').trim(),
+  'x-user-role': 'MANAGER',
+});
+
+const fetchVendorPayoutsForEventFromOrderService = async ({ eventId, user }) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  const response = await axios.get(
+    `${orderServiceUrl}/orders/vendor-payouts/event/${encodeURIComponent(normalizedEventId)}`,
+    {
+      timeout: upstreamTimeoutMs,
+      headers: buildInternalOrderServiceHeaders(user),
+    }
+  );
+
+  const payouts = Array.isArray(response?.data?.data?.payouts) ? response.data.data.payouts : [];
+  return payouts;
+};
+
+const fetchVendorPayoutsForVendorFromOrderService = async ({ vendorAuthId, user }) => {
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  if (!normalizedVendorAuthId) return [];
+
+  const response = await axios.get(
+    `${orderServiceUrl}/orders/vendor-payouts/vendor/${encodeURIComponent(normalizedVendorAuthId)}`,
+    {
+      timeout: upstreamTimeoutMs,
+      headers: buildInternalOrderServiceHeaders(user),
+    }
+  );
+
+  const payouts = Array.isArray(response?.data?.data?.payouts) ? response.data.data.payouts : [];
+  return payouts;
+};
+
+const toInrFromPaise = (value) => {
+  const paise = Number(value || 0);
+  if (!Number.isFinite(paise) || paise <= 0) return 0;
+  return Number((paise / 100).toFixed(2));
+};
+
+const toDateLabel = (value) => {
+  const d = value ? new Date(value) : null;
+  if (!d || Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
 };
 
 const fetchPublicVendorsByAuthIds = async (authIds) => {
@@ -165,6 +227,57 @@ const computeVenueLocationFromService = (service) => {
   return { name, latitude: lat, longitude: lng };
 };
 
+const extractServiceLocationLabel = (service) => {
+  if (!service || typeof service !== 'object') return null;
+
+  const details = service.details && typeof service.details === 'object' ? service.details : {};
+
+  const deriveReadableLocationFromMapUrl = (rawUrl) => {
+    if (!rawUrl) return null;
+    try {
+      const u = new URL(String(rawUrl).trim());
+
+      // Common format: /maps/place/<label>/...
+      const placeMatch = String(u.pathname || '').match(/\/maps\/place\/([^/]+)/i);
+      if (placeMatch?.[1]) {
+        const decoded = decodeURIComponent(placeMatch[1]).replace(/\+/g, ' ').trim();
+        if (decoded) return decoded;
+      }
+
+      // Fallback for query labels (ignore raw lat,lng query).
+      const q = String(u.searchParams.get('q') || u.searchParams.get('query') || '').trim();
+      if (q) {
+        const looksLikeCoordinates = /^-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?$/.test(q);
+        if (!looksLikeCoordinates) {
+          const decodedQ = decodeURIComponent(q).replace(/\+/g, ' ').trim();
+          if (decodedQ) return decodedQ;
+        }
+      }
+
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  const mapUrl = details.locationMapsUrl || details.mapsUrl || details.googleMapsUrl;
+  const mapUrlLabel = deriveReadableLocationFromMapUrl(mapUrl);
+  const candidates = [
+    details.locationAreaName,
+    details.location,
+    details.address,
+    mapUrlLabel,
+    details.locationMapsUrl,
+    details.mapsUrl,
+    details.googleMapsUrl,
+  ]
+    .map((v) => (v == null ? '' : String(v).trim()))
+    .filter((v) => v.length > 0);
+
+  const nonUrl = candidates.find((v) => !/^https?:\/\//i.test(v));
+  return nonUrl || candidates[0] || null;
+};
+
 const ensureAccessToPlanning = async ({ eventId, user }) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
 
@@ -257,8 +370,7 @@ const clearStaleSelectionLocks = async ({ selection, planning, dayOverride = nul
     Boolean(planning?.depositPaid) ||
     Boolean(planning?.vendorConfirmationPaid) ||
     Boolean(planning?.fullPaymentPaid) ||
-    planningStatus === PLANNING_STATUS.CONFIRMED ||
-    planningStatus === PLANNING_STATUS.COMPLETED;
+    STICKY_PLANNING_STATUSES.has(planningStatus);
 
   const shouldAttemptHoldRepair = isStickyPlanning || isRecentSelection;
   const preferredRepairDays = requestedDays.length > 0 ? requestedDays : planningDays;
@@ -838,6 +950,7 @@ const listVendorRequests = async (req, res) => {
           vendorQuotedPrice: v.vendorQuotedPrice ?? null,
           commissionPercent: v.commissionPercent ?? null,
           commissionAmount: v.commissionAmount ?? null,
+          priceHikeReason: v.priceHikeReason || null,
           priceLocked: Boolean(v.priceLocked),
           pricingUnit: v.pricingUnit || null,
           pricingQuantity: v.pricingQuantity ?? null,
@@ -878,6 +991,100 @@ const listVendorRequests = async (req, res) => {
     });
   } catch (error) {
     logger.error('Error in listVendorRequests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * GET /vendor/requests/ledger
+ * Vendor-facing: payout ledger across events.
+ */
+const listVendorPayoutLedger = async (req, res) => {
+  try {
+    const vendorAuthId = normalizeVendorAuthId(req);
+
+    let payoutRows = [];
+    try {
+      payoutRows = await fetchVendorPayoutsForVendorFromOrderService({ vendorAuthId, user: req.user });
+    } catch (payoutError) {
+      logger.error('Failed to fetch vendor payout ledger from order-service', {
+        vendorAuthId,
+        message: payoutError?.message || String(payoutError),
+      });
+      throw createApiError(502, 'Unable to load vendor payout ledger right now');
+    }
+
+    const eventIds = Array.from(new Set(
+      (Array.isArray(payoutRows) ? payoutRows : [])
+        .map((row) => String(row?.eventId || '').trim())
+        .filter(Boolean)
+    ));
+
+    const plannings = eventIds.length > 0
+      ? await Planning.find({ eventId: { $in: eventIds } })
+        .select('eventId eventTitle status eventDate schedule category')
+        .lean()
+      : [];
+    const planningByEventId = new Map(plannings.map((row) => [String(row?.eventId || '').trim(), row]));
+
+    const rows = (Array.isArray(payoutRows) ? payoutRows : [])
+      .slice()
+      .sort((a, b) => {
+        const at = new Date(a?.paidAt || a?.createdAt || 0).getTime();
+        const bt = new Date(b?.paidAt || b?.createdAt || 0).getTime();
+        return bt - at;
+      })
+      .map((row, index) => {
+        const normalizedEventId = String(row?.eventId || '').trim();
+        const planning = planningByEventId.get(normalizedEventId) || null;
+        const paidAt = row?.paidAt || row?.createdAt || null;
+        const mode = String(row?.payoutMode || 'DEMO').trim().toUpperCase() === 'RAZORPAY'
+          ? 'RAZORPAY'
+          : 'DEMO';
+        const amountInr = toInrFromPaise(row?.payoutAmountPaise);
+        const status = String(row?.status || '').trim().toUpperCase();
+
+        return {
+          id: String(row?.payoutId || `ledger-${index + 1}`),
+          payoutId: row?.payoutId || null,
+          eventId: normalizedEventId,
+          eventTitle: planning?.eventTitle || `Event ${normalizedEventId || 'Unknown'}`,
+          eventDate: planning?.eventDate || planning?.schedule?.startAt || null,
+          planningStatus: planning?.status || null,
+          service: row?.service || null,
+          status,
+          amountInr,
+          currency: row?.currency || 'INR',
+          payoutMode: mode,
+          paidAt,
+          dateLabel: toDateLabel(paidAt),
+          managerAuthId: row?.managerAuthId || null,
+          sourcePaymentId: row?.sourcePaymentId || null,
+          razorpayTransferId: row?.razorpayTransferId || null,
+        };
+      });
+
+    const successfulRows = rows.filter((row) => row.status === 'SUCCESS');
+    const totalReceived = Number(successfulRows.reduce((sum, row) => sum + Number(row.amountInr || 0), 0).toFixed(2));
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        vendorAuthId,
+        rows,
+        summary: {
+          totalRows: rows.length,
+          successfulPayoutCount: successfulRows.length,
+          totalReceived,
+          currency: 'INR',
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Error in listVendorPayoutLedger:', error);
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
@@ -1022,8 +1229,13 @@ const getVendorRequestDetails = async (req, res) => {
     }
 
     let commissionRateByService = new Map();
+    let vendorHikeRate = commissionService.DEFAULT_VENDOR_HIKE_RATE;
     try {
       const cfg = await commissionService.getCommissionConfig();
+      const hikeRateRaw = Number(cfg?.vendorHikeRate);
+      vendorHikeRate = Number.isFinite(hikeRateRaw) && hikeRateRaw >= 1
+        ? hikeRateRaw
+        : commissionService.DEFAULT_VENDOR_HIKE_RATE;
       commissionRateByService = new Map(
         Object.entries(cfg?.rates || {}).map(([serviceName, percent]) => {
           const normalized = vendorSelectionService.canonicalizeService(serviceName) || String(serviceName || '').trim();
@@ -1078,34 +1290,32 @@ const getVendorRequestDetails = async (req, res) => {
 
       const lockedPriceCandidate = servicePriceMin > 0 ? servicePriceMin : 0;
 
-      if (vendorQuotedPrice == null && commissionAmount != null && lockedPriceCandidate > 0) {
-        vendorQuotedPrice = toMoneyOrNull(lockedPriceCandidate - commissionAmount);
-      }
-
-      if (commissionAmount == null && vendorQuotedPrice != null && lockedPriceCandidate > 0) {
-        commissionAmount = toMoneyOrNull(Math.max(0, lockedPriceCandidate - vendorQuotedPrice));
-      }
-
+      // Commission-inclusive rule:
+      // vendorQuotedPrice represents final client payable amount.
+      // Commission is a split inside this amount, not an add-on.
       if (vendorQuotedPrice == null && lockedPriceCandidate > 0) {
-        const pctForCalc = commissionPercent != null ? commissionPercent : safeCommissionRate;
-        if (pctForCalc > 0) {
-          vendorQuotedPrice = toMoneyOrNull(lockedPriceCandidate / (1 + (pctForCalc / 100)));
-          commissionAmount = toMoneyOrNull(Math.max(0, lockedPriceCandidate - Number(vendorQuotedPrice || 0)));
-          if (commissionPercent == null) commissionPercent = pctForCalc;
-        } else {
-          vendorQuotedPrice = toMoneyOrNull(lockedPriceCandidate);
-          if (commissionAmount == null) commissionAmount = 0;
-          if (commissionPercent == null) commissionPercent = pctForCalc;
-        }
+        vendorQuotedPrice = toMoneyOrNull(lockedPriceCandidate);
+      }
+
+      if (commissionPercent == null) {
+        commissionPercent = safeCommissionRate;
       }
 
       if (commissionAmount == null && vendorQuotedPrice != null && commissionPercent != null) {
         commissionAmount = toMoneyOrNull((vendorQuotedPrice * commissionPercent) / 100);
       }
 
+      // Legacy fallback for old additive records where locked total may have been persisted.
+      if (commissionAmount == null && vendorQuotedPrice != null && lockedPriceCandidate > vendorQuotedPrice) {
+        commissionAmount = toMoneyOrNull(Math.max(0, lockedPriceCandidate - vendorQuotedPrice));
+      }
+
       if (commissionPercent == null && vendorQuotedPrice != null && commissionAmount != null && vendorQuotedPrice > 0) {
         commissionPercent = Number(((commissionAmount / vendorQuotedPrice) * 100).toFixed(2));
       }
+
+      if (commissionPercent == null) commissionPercent = 0;
+      if (commissionAmount == null) commissionAmount = 0;
 
       const isAccepted = String(v?.status || '').trim() === VENDOR_STATUS.ACCEPTED;
       let priceLocked = Boolean(v?.priceLocked);
@@ -1146,6 +1356,7 @@ const getVendorRequestDetails = async (req, res) => {
         vendorQuotedPrice: vendorQuotedPrice ?? null,
         commissionPercent: commissionPercent ?? null,
         commissionAmount: commissionAmount ?? null,
+        priceHikeReason: v.priceHikeReason || null,
         priceLocked,
         pricingUnit: v.pricingUnit || null,
         pricingQuantity: v.pricingQuantity ?? null,
@@ -1193,6 +1404,71 @@ const getVendorRequestDetails = async (req, res) => {
       }
     }
 
+    let eventPayoutRows = [];
+    try {
+      eventPayoutRows = await fetchVendorPayoutsForEventFromOrderService({ eventId, user: req.user });
+    } catch (payoutError) {
+      logger.warn('Failed to fetch event payouts while hydrating vendor request details', {
+        eventId,
+        vendorAuthId,
+        message: payoutError?.message || String(payoutError),
+      });
+    }
+
+    const successfulVendorPayouts = (Array.isArray(eventPayoutRows) ? eventPayoutRows : [])
+      .filter((row) => String(row?.vendorAuthId || '').trim() === vendorAuthId)
+      .filter((row) => String(row?.status || '').trim().toUpperCase() === 'SUCCESS');
+
+    const amountReceived = successfulVendorPayouts.reduce(
+      (sum, row) => sum + toInrFromPaise(row?.payoutAmountPaise),
+      0
+    );
+
+    const payoutModeCounts = successfulVendorPayouts.reduce((acc, row) => {
+      const mode = String(row?.payoutMode || 'DEMO').trim().toUpperCase() === 'RAZORPAY'
+        ? 'RAZORPAY'
+        : 'DEMO';
+      acc[mode] = (acc[mode] || 0) + 1;
+      return acc;
+    }, {});
+
+    const ledgerEntries = successfulVendorPayouts
+      .slice()
+      .sort((a, b) => {
+        const at = new Date(a?.paidAt || a?.createdAt || 0).getTime();
+        const bt = new Date(b?.paidAt || b?.createdAt || 0).getTime();
+        return bt - at;
+      })
+      .map((row) => {
+        const paidAt = row?.paidAt || row?.createdAt || null;
+        const mode = String(row?.payoutMode || 'DEMO').trim().toUpperCase() === 'RAZORPAY'
+          ? 'RAZORPAY'
+          : 'DEMO';
+        const amountInr = toInrFromPaise(row?.payoutAmountPaise);
+
+        return {
+          id: String(row?.payoutId || `${eventId}:${row?.service || 'service'}`),
+          payoutId: row?.payoutId || null,
+          eventId,
+          eventTitle: planning?.eventTitle || null,
+          dateLabel: toDateLabel(paidAt),
+          date: paidAt,
+          description: `${row?.service || 'Service'} payout received`,
+          status: 'RECEIVED',
+          type: 'Credit',
+          signedAmount: amountInr,
+          amountInr,
+          payoutMode: mode,
+          service: row?.service || null,
+          currency: row?.currency || 'INR',
+          managerAuthId: row?.managerAuthId || null,
+          razorpayTransferId: row?.razorpayTransferId || null,
+          sourcePaymentId: row?.sourcePaymentId || null,
+        };
+      });
+
+    const baseSummary = summarizeVendorItems(vendorItems);
+
     return res.status(200).json({
       success: true,
       data: {
@@ -1206,8 +1482,23 @@ const getVendorRequestDetails = async (req, res) => {
           managerAssigned: Boolean(selection.managerId),
         },
         managerProfile,
+        pricingConfig: {
+          vendorHikeRate,
+        },
         vendorItems,
-        summary: summarizeVendorItems(vendorItems),
+        ledgerEntries,
+        payment: {
+          amountReceived,
+          payoutCount: successfulVendorPayouts.length,
+          payoutModeCounts,
+          lastPaidAt: successfulVendorPayouts[0]?.paidAt || successfulVendorPayouts[0]?.createdAt || null,
+        },
+        summary: {
+          ...baseSummary,
+          amountReceived,
+          payoutCount: successfulVendorPayouts.length,
+          payoutModeCounts,
+        },
       },
     });
   } catch (error) {
@@ -1223,13 +1514,14 @@ const lockVendorServicePrice = async (req, res) => {
   try {
     const vendorAuthId = normalizeVendorAuthId(req);
     const eventId = normalizeEventIdParam(req.params.eventId);
-    const { service, price } = req.body || {};
+    const { service, price, priceHikeReason } = req.body || {};
 
     const result = await vendorSelectionService.lockPriceForVendor({
       eventId,
       vendorAuthId,
       service,
       quotedPrice: price,
+      priceHikeReason,
     });
 
     const vendorItems = (result?.selection?.vendors || [])
@@ -1244,6 +1536,7 @@ const lockVendorServicePrice = async (req, res) => {
         vendorQuotedPrice: v.vendorQuotedPrice ?? null,
         commissionPercent: v.commissionPercent ?? null,
         commissionAmount: v.commissionAmount ?? null,
+        priceHikeReason: v.priceHikeReason || null,
         priceLocked: Boolean(v.priceLocked),
         pricingUnit: v.pricingUnit || null,
         pricingQuantity: v.pricingQuantity ?? null,
@@ -1260,6 +1553,8 @@ const lockVendorServicePrice = async (req, res) => {
         commissionPercent: result.commissionPercent,
         commissionAmount: result.commissionAmount,
         lockedPrice: result.lockedPrice,
+        priceHikeReason: result.priceHikeReason || null,
+        vendorHikeRate: result.vendorHikeRate,
         vendorItems,
         summary: summarizeVendorItems(vendorItems),
       },
@@ -1324,7 +1619,7 @@ const acceptVendorRequest = async (req, res) => {
       });
     }
 
-    const planning = await Planning.findOne({ eventId }).select('status eventId').lean();
+    const planning = await Planning.findOne({ eventId }).select('status eventId authId assignedManagerId eventTitle').lean();
     let planningStatusUpdated = false;
     let nextPlanningStatus = planning?.status || null;
 
@@ -1341,6 +1636,31 @@ const acceptVendorRequest = async (req, res) => {
           message: err?.message,
         });
       }
+    }
+
+    const progress = summarizeVendorItems(Array.isArray(selection?.vendors) ? selection.vendors : []);
+    try {
+      await publishEvent('VENDOR_REQUEST_ACCEPTED', {
+        eventId: String(eventId || '').trim(),
+        authId: String(planning?.authId || '').trim() || null,
+        managerAuthId: String(planning?.assignedManagerId || '').trim() || null,
+        vendorAuthId,
+        service: service != null ? String(service).trim() : null,
+        eventTitle: String(planning?.eventTitle || '').trim() || null,
+        progress: {
+          ...progress,
+          vendorsAccepted: Boolean(selection?.vendorsAccepted),
+        },
+        planningStatus: nextPlanningStatus || null,
+        occurredAt: new Date().toISOString(),
+      });
+    } catch (publishError) {
+      logger.warn('Failed to publish VENDOR_REQUEST_ACCEPTED', {
+        eventId,
+        vendorAuthId,
+        service: service || null,
+        message: publishError?.message || String(publishError),
+      });
     }
 
     return res.status(200).json({
@@ -1382,6 +1702,7 @@ const rejectVendorRequest = async (req, res) => {
       .select('_id status eventId authId assignedManagerId selectedServices eventTitle category eventType customEventType eventDate schedule location')
       .lean();
     const planningDays = vendorReservationService.planningToReservationDays(planning);
+    const planningDay = planningDays[0] || normalizeIstDayInput(planning?.eventDate);
 
     const { selection, vendorAcceptedAnyServiceAfter, transitionedRejectedServices } = await vendorSelectionService.respondForVendor({
       eventId,
@@ -1407,6 +1728,37 @@ const rejectVendorRequest = async (req, res) => {
       await Planning.updateOne({ eventId }, { $set: { status: PLANNING_STATUS.PENDING_APPROVAL } });
       planningStatusUpdated = true;
       nextPlanningStatus = PLANNING_STATUS.PENDING_APPROVAL;
+    }
+
+    const rejectedServices = Array.isArray(transitionedRejectedServices) && transitionedRejectedServices.length > 0
+      ? transitionedRejectedServices
+      : (service ? [service] : []);
+    const progress = summarizeVendorItems(Array.isArray(selection?.vendors) ? selection.vendors : []);
+    for (const rejectedService of rejectedServices) {
+      try {
+        await publishEvent('VENDOR_REQUEST_REJECTED', {
+          eventId: String(eventId || '').trim(),
+          authId: String(planning?.authId || '').trim() || null,
+          managerAuthId: String(planning?.assignedManagerId || '').trim() || null,
+          vendorAuthId,
+          service: rejectedService,
+          rejectionReason,
+          eventTitle: String(planning?.eventTitle || '').trim() || null,
+          progress: {
+            ...progress,
+            vendorsAccepted: Boolean(selection?.vendorsAccepted),
+          },
+          planningStatus: nextPlanningStatus || null,
+          occurredAt: new Date().toISOString(),
+        });
+      } catch (publishError) {
+        logger.warn('Failed to publish VENDOR_REQUEST_REJECTED', {
+          eventId,
+          vendorAuthId,
+          service: rejectedService,
+          message: publishError?.message || String(publishError),
+        });
+      }
     }
 
     // If vendor is no longer participating in any service for this event, release reservation(s) (best-effort).
@@ -1868,12 +2220,19 @@ const getOrCreateForPlanning = async (req, res) => {
         )
       );
 
-      const serviceNameById = new Map();
+      const serviceMetaById = new Map();
       await Promise.all(serviceIds.map(async (serviceId) => {
         try {
           const svc = await fetchPublicServiceById(serviceId);
           const name = String(svc?.name || '').trim();
-          if (name) serviceNameById.set(serviceId, name);
+          const rawCategory = String(svc?.serviceCategory || svc?.category || '').trim();
+          const location = extractServiceLocationLabel(svc);
+
+          serviceMetaById.set(serviceId, {
+            name: name || null,
+            category: rawCategory || null,
+            location: location || null,
+          });
         } catch (e) {
           logger.warn('Failed to resolve service name for vendor selection row', {
             eventId: String(eventId || '').trim(),
@@ -1885,12 +2244,19 @@ const getOrCreateForPlanning = async (req, res) => {
 
       const enrichedVendors = rawVendors.map((v) => {
         const sid = v?.serviceId != null ? String(v.serviceId).trim() : '';
+        const meta = sid ? serviceMetaById.get(sid) : null;
         const directName = String(v?.serviceName || '').trim();
-        const resolvedName = directName || (sid ? String(serviceNameById.get(sid) || '').trim() : '');
+        const resolvedName = directName || String(meta?.name || '').trim();
+
+        const normalizedService = vendorSelectionService.canonicalizeService(String(v?.service || '').trim());
+        const normalizedMetaCategory = vendorSelectionService.canonicalizeService(String(meta?.category || '').trim());
+        const isVenue = normalizedService === 'venue' || normalizedMetaCategory === 'venue';
 
         return {
           ...v,
           serviceName: resolvedName || null,
+          serviceCategory: v?.serviceCategory || meta?.category || null,
+          serviceLocation: isVenue ? (v?.serviceLocation || meta?.location || null) : null,
         };
       });
 
@@ -1947,6 +2313,10 @@ const updateSelectedServices = async (req, res) => {
       eventId,
       authId: planning.authId,
       selectedServices,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      emergencyOverride: Boolean(req.body?.emergencyOverride),
+      emergencyReason: req.body?.emergencyReason,
     });
 
     return res.status(200).json({
@@ -1976,12 +2346,57 @@ const upsertVendor = async (req, res) => {
     }
 
     const planning = await ensureAccessToPlanning({ eventId, user: req.user });
+    const previousSelection = await vendorSelectionService.getByEventId(eventId);
 
     const selection = await vendorSelectionService.upsertVendor({
       eventId,
       authId: planning.authId,
       vendorUpdate: req.body,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      emergencyOverride: Boolean(req.body?.emergencyOverride),
+      emergencyReason: req.body?.emergencyReason,
     });
+
+    const requestedService = vendorSelectionService.canonicalizeService(String(req.body?.service || '').trim());
+    const previousItem = Array.isArray(previousSelection?.vendors)
+      ? previousSelection.vendors.find((row) => String(row?.service || '').trim() === requestedService)
+      : null;
+    const nextItem = Array.isArray(selection?.vendors)
+      ? selection.vendors.find((row) => String(row?.service || '').trim() === requestedService)
+      : null;
+
+    const previousVendorAuthId = previousItem?.vendorAuthId != null ? String(previousItem.vendorAuthId).trim() : '';
+    const nextVendorAuthId = nextItem?.vendorAuthId != null ? String(nextItem.vendorAuthId).trim() : '';
+    const previousStatus = String(previousItem?.status || '').trim();
+    const nextStatus = String(nextItem?.status || '').trim();
+
+    const shouldNotifyBookingRequest = Boolean(nextVendorAuthId)
+      && nextStatus === VENDOR_STATUS.YET_TO_SELECT
+      && (nextVendorAuthId !== previousVendorAuthId || previousStatus !== VENDOR_STATUS.YET_TO_SELECT);
+
+    if (shouldNotifyBookingRequest) {
+      const progress = summarizeVendorItems(Array.isArray(selection?.vendors) ? selection.vendors : []);
+      try {
+        await publishEvent('VENDOR_BOOKING_REQUEST_RECEIVED', {
+          eventId: String(eventId || '').trim(),
+          authId: String(planning?.authId || '').trim() || null,
+          managerAuthId: String(planning?.assignedManagerId || '').trim() || null,
+          vendorAuthId: nextVendorAuthId,
+          service: requestedService || null,
+          eventTitle: String(planning?.eventTitle || '').trim() || null,
+          progress,
+          occurredAt: new Date().toISOString(),
+        });
+      } catch (publishError) {
+        logger.warn('Failed to publish VENDOR_BOOKING_REQUEST_RECEIVED', {
+          eventId,
+          service: requestedService,
+          vendorAuthId: nextVendorAuthId,
+          message: publishError?.message || String(publishError),
+        });
+      }
+    }
 
     return res.status(200).json({
       success: true,
@@ -1990,6 +2405,127 @@ const upsertVendor = async (req, res) => {
     });
   } catch (error) {
     logger.error('Error in upsertVendor:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * POST /vendor-selection/:eventId/change-request
+ * Body: { selectedServices: string[], reason?: string, emergencyOverride?: boolean, emergencyReason?: string }
+ * Creates a managed service-change request (used after vendor confirmation lock).
+ */
+const createServiceChangeRequest = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    const planning = await ensureAccessToPlanning({ eventId, user: req.user });
+    const result = await vendorSelectionService.createServiceChangeRequest({
+      eventId,
+      authId: planning.authId,
+      selectedServices: req.body?.selectedServices,
+      reason: req.body?.reason,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      emergencyOverride: Boolean(req.body?.emergencyOverride),
+      emergencyReason: req.body?.emergencyReason,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Change request submitted for manager review',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in createServiceChangeRequest:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * PATCH /vendor-selection/:eventId/change-request/:requestId/manager-decision
+ * Body: { approve: boolean, note?: string }
+ */
+const decideServiceChangeRequestByManager = async (req, res) => {
+  try {
+    const { eventId, requestId } = req.params;
+
+    if (!req.user?.authId) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    const planning = await ensureAccessToPlanning({ eventId, user: req.user });
+    const approve = req.body?.approve === true;
+
+    const result = await vendorSelectionService.decideServiceChangeRequestByManager({
+      eventId,
+      authId: planning.authId,
+      requestId,
+      managerAuthId: req.user?.authId,
+      approve,
+      note: req.body?.note,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: approve
+        ? (result?.applied ? 'Change request approved and applied' : 'Change request approved; awaiting vendor consent')
+        : 'Change request rejected',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in decideServiceChangeRequestByManager:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * PATCH /vendor-selection/:eventId/change-request/:requestId/vendor-consent
+ * Body: { approve: boolean, note?: string }
+ */
+const submitVendorConsentForServiceChangeRequest = async (req, res) => {
+  try {
+    const { eventId, requestId } = req.params;
+    const vendorAuthId = normalizeVendorAuthId(req);
+    const approve = req.body?.approve === true;
+
+    const planning = await Planning.findOne({ eventId: String(eventId || '').trim() })
+      .select('authId eventId')
+      .lean();
+    if (!planning) {
+      return res.status(404).json({ success: false, message: 'Planning not found' });
+    }
+
+    const result = await vendorSelectionService.submitVendorConsentForServiceChangeRequest({
+      eventId,
+      authId: planning.authId,
+      requestId,
+      vendorAuthId,
+      approve,
+      note: req.body?.note,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: approve
+        ? (result?.applied ? 'Consent recorded and change request applied' : 'Consent recorded')
+        : 'Consent rejected; change request closed',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in submitVendorConsentForServiceChangeRequest:', error);
     return res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
@@ -2040,8 +2576,12 @@ module.exports = {
   getOrCreateForPlanning,
   updateSelectedServices,
   upsertVendor,
+  createServiceChangeRequest,
+  decideServiceChangeRequestByManager,
+  submitVendorConsentForServiceChangeRequest,
   unlockReservations,
   listVendorRequests,
+  listVendorPayoutLedger,
   getVendorRequestDetails,
   lockVendorServicePrice,
   acceptVendorRequest,

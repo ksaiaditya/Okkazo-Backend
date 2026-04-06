@@ -12,7 +12,12 @@ const {
 } = require('../utils/istDateTime');
 
 const HOLD_TTL_MS = Math.max(60 * 1000, Number(process.env.VENDOR_RESERVATION_HOLD_TTL_MS || 10 * 60 * 1000));
-const STICKY_PLANNING_STATUSES = new Set([STATUS.CONFIRMED, STATUS.COMPLETED]);
+const STICKY_PLANNING_STATUSES = new Set([
+  STATUS.CONFIRMED,
+  STATUS.COMPLETED,
+  STATUS.VENDOR_PAYMENT_PENDING,
+  STATUS.CLOSED,
+]);
 const VENUE_SERVICE_LABEL = 'Venue';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_RANGE_DAYS = 366;

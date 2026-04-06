@@ -112,6 +112,28 @@ const startConsuming = async () => {
             } catch (publishError) {
               logger.error('Failed to publish PLANNING_VENDOR_CONFIRMATION_PAYMENT_CONFIRMED event:', publishError.message);
             }
+          } else if (orderType === 'PLANNING EVENT REMAINING FEE') {
+            // ── Planning remaining payment confirmed (private flow) ───────
+            const planning = await planningService.markPlanningRemainingPaymentPaid(payload.eventId, {
+              amountPaise: payload.amount,
+              currency: payload.currency,
+              paidAt: payload.paidAt,
+            });
+
+            try {
+              await publishEvent('PLANNING_REMAINING_PAYMENT_CONFIRMED', {
+                eventId: planning.eventId,
+                authId: planning.authId,
+                status: planning.status,
+                remainingPaymentPaid: Boolean(planning.remainingPaymentPaid),
+                paymentOrderId: payload.paymentOrderId,
+                razorpayOrderId: payload.razorpayOrderId,
+                razorpayPaymentId: payload.razorpayPaymentId,
+                paidAt: payload.paidAt,
+              });
+            } catch (publishError) {
+              logger.error('Failed to publish PLANNING_REMAINING_PAYMENT_CONFIRMED event:', publishError.message);
+            }
           } else if (orderType === 'TICKET SALE') {
             const ticket = await ticketMarketplaceService.markTicketSalePaid(payload);
 
@@ -121,6 +143,10 @@ const startConsuming = async () => {
                   eventId: ticket.eventId,
                   authId: payload.authId,
                   ticketId: ticket.ticketId,
+                  eventTitle: ticket?.eventTitle || null,
+                  eventStartAt: ticket?.schedule?.startAt || null,
+                  schedule: ticket?.schedule || null,
+                  selectedDay: ticket?.tickets?.selectedDay || null,
                   paymentOrderId: payload.paymentOrderId,
                   razorpayOrderId: payload.razorpayOrderId,
                   razorpayPaymentId: payload.razorpayPaymentId,
@@ -152,6 +178,14 @@ const startConsuming = async () => {
             } catch (publishError) {
               logger.error('Failed to publish PLANNING_PAYMENT_CONFIRMED event:', publishError.message);
             }
+          }
+        }
+
+        if (eventType === 'VENDOR_PAYOUT_SUCCESS' && payload.eventId) {
+          try {
+            await planningService.syncPlanningStatusAfterVendorPayout(payload.eventId);
+          } catch (err) {
+            logger.error('Failed to sync planning status after vendor payout success:', err.message);
           }
         }
 

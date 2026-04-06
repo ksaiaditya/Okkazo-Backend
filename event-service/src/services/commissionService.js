@@ -22,6 +22,7 @@ const SERVICE_CATEGORIES = [
 ];
 
 const DEFAULT_COMMISSION_PERCENT = 0;
+const DEFAULT_VENDOR_HIKE_RATE = 1.25;
 
 const getDefaultRates = () => {
   const rates = {};
@@ -30,6 +31,8 @@ const getDefaultRates = () => {
 };
 
 const normalizeRatesInput = (rates) => {
+  if (rates == null) return null;
+
   if (!rates || typeof rates !== 'object' || Array.isArray(rates)) {
     throw createApiError(400, 'rates (object) is required');
   }
@@ -52,6 +55,17 @@ const normalizeRatesInput = (rates) => {
   return rates;
 };
 
+const normalizeVendorHikeRateInput = (vendorHikeRate) => {
+  if (vendorHikeRate == null || vendorHikeRate === '') return null;
+
+  const n = Number(vendorHikeRate);
+  if (!Number.isFinite(n) || n < 1 || n > 10) {
+    throw createApiError(400, 'vendorHikeRate must be a number between 1 and 10');
+  }
+
+  return Math.round(n * 100) / 100;
+};
+
 const getCommissionConfig = async () => {
   let cfg = await CommissionConfig.findOne({ key: CONFIG_KEY }).lean();
 
@@ -59,29 +73,49 @@ const getCommissionConfig = async () => {
     const created = await CommissionConfig.create({
       key: CONFIG_KEY,
       rates: getDefaultRates(),
+      vendorHikeRate: DEFAULT_VENDOR_HIKE_RATE,
       updatedByAuthId: null,
     });
     cfg = created.toObject();
   }
 
+  if (!Number.isFinite(Number(cfg?.vendorHikeRate)) || Number(cfg.vendorHikeRate) < 1) {
+    cfg.vendorHikeRate = DEFAULT_VENDOR_HIKE_RATE;
+  }
+
   return cfg;
 };
 
-const updateCommissionRates = async ({ rates, updatedByAuthId }) => {
+const updateCommissionRates = async ({ rates, vendorHikeRate, updatedByAuthId }) => {
   const incoming = normalizeRatesInput(rates);
+  const normalizedVendorHikeRate = normalizeVendorHikeRateInput(vendorHikeRate);
+
+  if (!incoming && normalizedVendorHikeRate == null) {
+    throw createApiError(400, 'At least one of rates or vendorHikeRate is required');
+  }
 
   const existing = await CommissionConfig.findOne({ key: CONFIG_KEY });
 
   const nextRates = { ...(existing?.rates?.toObject?.() || existing?.rates || getDefaultRates()) };
-  for (const [k, v] of Object.entries(incoming)) {
-    nextRates[k] = Number(v);
+  if (incoming) {
+    for (const [k, v] of Object.entries(incoming)) {
+      nextRates[k] = Number(v);
+    }
   }
+
+  const nextVendorHikeRate = normalizedVendorHikeRate != null
+    ? normalizedVendorHikeRate
+    : (() => {
+      const raw = Number(existing?.vendorHikeRate);
+      return Number.isFinite(raw) && raw >= 1 ? raw : DEFAULT_VENDOR_HIKE_RATE;
+    })();
 
   const updated = await CommissionConfig.findOneAndUpdate(
     { key: CONFIG_KEY },
     {
       $set: {
         rates: nextRates,
+        vendorHikeRate: nextVendorHikeRate,
         updatedByAuthId: updatedByAuthId || null,
       },
     },
@@ -96,6 +130,7 @@ const updateCommissionRates = async ({ rates, updatedByAuthId }) => {
 
 module.exports = {
   SERVICE_CATEGORIES,
+  DEFAULT_VENDOR_HIKE_RATE,
   getDefaultRates,
   getCommissionConfig,
   updateCommissionRates,

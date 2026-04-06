@@ -10,6 +10,7 @@ const getCommission = async (req, res) => {
       success: true,
       data: {
         rates: cfg?.rates || commissionService.getDefaultRates(),
+        vendorHikeRate: Number(cfg?.vendorHikeRate) || commissionService.DEFAULT_VENDOR_HIKE_RATE,
         updatedAt: cfg?.updatedAt || null,
         updatedByAuthId: cfg?.updatedByAuthId || null,
       },
@@ -26,10 +27,11 @@ const getCommission = async (req, res) => {
 // PUT /admin/commission (Admin only)
 const updateCommission = async (req, res) => {
   try {
-    const { rates } = req.body || {};
+    const { rates, vendorHikeRate } = req.body || {};
 
     const updated = await commissionService.updateCommissionRates({
       rates,
+      vendorHikeRate,
       updatedByAuthId: req.user?.authId,
     });
 
@@ -38,6 +40,7 @@ const updateCommission = async (req, res) => {
       message: 'Commission rates updated',
       data: {
         rates: updated?.rates || commissionService.getDefaultRates(),
+        vendorHikeRate: Number(updated?.vendorHikeRate) || commissionService.DEFAULT_VENDOR_HIKE_RATE,
         updatedAt: updated?.updatedAt || null,
         updatedByAuthId: updated?.updatedByAuthId || null,
       },

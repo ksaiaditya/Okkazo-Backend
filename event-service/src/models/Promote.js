@@ -280,6 +280,49 @@ const PromoteSchema = new mongoose.Schema(
       max: 100,
     },
 
+    generatedRevenuePayout: {
+      mode: {
+        type: String,
+        enum: ['DEMO', 'RAZORPAY'],
+        default: null,
+      },
+      status: {
+        type: String,
+        enum: ['PENDING', 'SUCCESS', 'FAILED'],
+        default: null,
+      },
+      amountPaise: {
+        type: Number,
+        min: 0,
+        default: null,
+      },
+      currency: {
+        type: String,
+        trim: true,
+        default: 'INR',
+      },
+      paidAt: {
+        type: Date,
+        default: null,
+      },
+      paidByAuthId: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      transactionRef: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      notes: {
+        type: String,
+        trim: true,
+        maxlength: 500,
+        default: null,
+      },
+    },
+
     // Revenue calculations (computed and stored on save)
     totalAmount: {
       type: Number,

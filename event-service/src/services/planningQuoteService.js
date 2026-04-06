@@ -91,7 +91,9 @@ const lockQuoteAtApproved = async ({ eventId, lockedByAuthId = null } = {}) => {
   const existing = await PlanningQuoteSnapshot.findOne({ eventId: String(eventId).trim(), statusAtLock: STATUS.APPROVED })
     .sort({ version: -1 })
     .lean();
-  if (existing) {
+  const existingVersion = Number(existing?.version || 0);
+  const stampedVersion = Number(planning?.quoteLockedVersion || 0);
+  if (existing && stampedVersion > 0 && existingVersion === stampedVersion) {
     try {
       await publishEvent(
         'PLANNING_QUOTE_LOCKED',

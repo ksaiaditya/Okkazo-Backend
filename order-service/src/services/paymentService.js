@@ -3,6 +3,10 @@ const crypto = require('crypto');
 const Joi = require('joi');
 const PDFDocument = require('pdfkit');
 const PaymentOrder = require('../models/PaymentOrder');
+const VendorPayoutAccount = require('../models/VendorPayoutAccount');
+const VendorPayout = require('../models/VendorPayout');
+const UserPayoutAccount = require('../models/UserPayoutAccount');
+const UserRevenuePayout = require('../models/UserRevenuePayout');
 const paymentSettingsService = require('./paymentSettingsService');
 const { getRazorpayClient } = require('../config/razorpay');
 const { publishEvent } = require('../kafka/eventProducer');
@@ -14,6 +18,8 @@ const {
   normalizeRazorpayError,
 } = require('../utils/normalizeError');
 
+const RAZORPAY_API_BASE_URL = (process.env.RAZORPAY_API_BASE_URL || 'https://api.razorpay.com').replace(/\/$/, '');
+
 const createOrderSchema = Joi.object({
   eventId: Joi.string().trim().required(),
   orderType: Joi
@@ -23,6 +29,7 @@ const createOrderSchema = Joi.object({
       'PLANNING EVENT',
       'PLANNING EVENT DEPOSIT FEE',
       'PLANNING EVENT VENDOR CONFIRMATION FEE',
+      'PLANNING EVENT REMAINING FEE',
       'PROMOTE EVENT',
       'TICKET SALE',
       'REFUND'
@@ -65,18 +72,44 @@ const refundPaymentSchema = Joi.object({
   reason: Joi.string().trim().max(500).optional(),
 });
 
+const vendorPayoutOnboardingLinkSchema = Joi.object({
+  callbackUrl: Joi.string().uri({ scheme: ['http', 'https'] }).optional(),
+});
+
+const userPayoutOnboardingLinkSchema = Joi.object({
+  callbackUrl: Joi.string().uri({ scheme: ['http', 'https'] }).optional(),
+});
+
+const vendorPayoutReleaseSchema = Joi.object({
+  eventId: Joi.string().trim().required(),
+  vendorAuthId: Joi.string().trim().required(),
+  service: Joi.string().trim().optional(),
+});
+
+const userRevenuePayoutReleaseSchema = Joi.object({
+  eventId: Joi.string().trim().required(),
+  userAuthId: Joi.string().trim().required(),
+  payoutAmountPaise: Joi.number().integer().min(1).required(),
+  generatedRevenuePaise: Joi.number().integer().min(0).required(),
+  totalVendorCostPaise: Joi.number().integer().min(0).required(),
+  totalFeesPaise: Joi.number().integer().min(0).required(),
+  currency: Joi.string().trim().uppercase().length(3).default('INR'),
+});
+
 const adminLedgerQuerySchema = Joi.object({
   page: Joi.number().integer().min(1).default(1),
   limit: Joi.number().integer().min(1).max(100).default(10),
   search: Joi.string().trim().allow('').optional(),
-  status: Joi.string().trim().uppercase().valid('CREATED', 'PAID', 'FAILED', 'REFUNDED', 'REFUND_FAILED').optional(),
+  status: Joi.string().trim().uppercase().valid('CREATED', 'PAID', 'FAILED', 'REFUNDED', 'REFUND_FAILED', 'INITIATED', 'SUCCESS').optional(),
   type: Joi.string().trim().valid(
     'PLANNING EVENT',
     'PLANNING EVENT DEPOSIT FEE',
     'PLANNING EVENT VENDOR CONFIRMATION FEE',
+    'PLANNING EVENT REMAINING FEE',
     'PROMOTE EVENT',
     'TICKET SALE',
-    'REFUND'
+    'REFUND',
+    'VENDOR PAYOUT'
   ).optional(),
   days: Joi.number().integer().min(1).max(3650).optional(),
   from: Joi.date().iso().optional(),
@@ -105,6 +138,7 @@ const mapOrderToAdminLedgerRow = (order) => ({
   transactionId: order.transactionId,
   eventId: order.eventId,
   authId: order.authId,
+  vendorId: order?.notes?.vendorAuthId || order?.notes?.vendorId || null,
   type: order.orderType,
   status: order.status,
   amount: normalizeLedgerAmount(order),
@@ -116,6 +150,37 @@ const mapOrderToAdminLedgerRow = (order) => ({
   createdAt: order.createdAt,
   paidAt: order.paidAt,
   refundedAt: order.refundedAt,
+});
+
+const resolveVendorPayoutMode = (row) => {
+  const notesMode = String(row?.notes?.payoutMode || '').trim().toUpperCase();
+  if (notesMode === 'RAZORPAY' || notesMode === 'DEMO') return notesMode;
+
+  const transferId = String(row?.razorpayTransferId || '').trim().toLowerCase();
+  if (transferId.startsWith('demo_')) return 'DEMO';
+
+  if (String(row?.linkedAccountId || '').trim().toUpperCase() === 'DEMO') return 'DEMO';
+  return 'RAZORPAY';
+};
+
+const mapVendorPayoutToAdminLedgerRow = (payout) => ({
+  transactionId: payout.payoutId,
+  eventId: payout.eventId,
+  authId: payout.managerAuthId || payout.vendorAuthId,
+  vendorId: payout.vendorAuthId,
+  type: 'VENDOR PAYOUT',
+  status: payout.status,
+  amount: -Math.abs(Number(payout.payoutAmountPaise || 0) || 0),
+  currency: payout.currency || 'INR',
+  vendor: payout?.notes?.vendorName || payout.vendorAuthId || 'Vendor',
+  razorpayOrderId: null,
+  razorpayPaymentId: payout.sourcePaymentId || null,
+  razorpayRefundId: null,
+  razorpayTransferId: payout.razorpayTransferId || null,
+  payoutMode: resolveVendorPayoutMode(payout),
+  createdAt: payout.createdAt,
+  paidAt: payout.paidAt,
+  refundedAt: null,
 });
 
 const buildAdminLedgerMongoQuery = (filters) => {
@@ -166,6 +231,74 @@ const buildAdminLedgerMongoQuery = (filters) => {
       { razorpayOrderId: regex },
       { razorpayPaymentId: regex },
       { razorpayRefundId: regex },
+    ];
+  }
+
+  return query;
+};
+
+const buildVendorPayoutLedgerMongoQuery = (filters) => {
+  const query = {};
+
+  if (filters.status) {
+    const statusMap = {
+      CREATED: 'INITIATED',
+      PAID: 'SUCCESS',
+      INITIATED: 'INITIATED',
+      SUCCESS: 'SUCCESS',
+      FAILED: 'FAILED',
+    };
+
+    const mappedStatus = statusMap[filters.status];
+    if (!mappedStatus) {
+      query._id = { $exists: false };
+      return query;
+    }
+    query.status = mappedStatus;
+  }
+
+  if (filters.type && filters.type !== 'VENDOR PAYOUT') {
+    query._id = { $exists: false };
+    return query;
+  }
+
+  const dateQuery = {};
+  if (filters.days) {
+    const start = new Date();
+    start.setUTCDate(start.getUTCDate() - Number(filters.days));
+    dateQuery.$gte = start;
+  }
+
+  if (filters.from) {
+    const from = new Date(filters.from);
+    if (!Number.isNaN(from.getTime())) {
+      dateQuery.$gte = from;
+    }
+  }
+
+  if (filters.to) {
+    const to = new Date(filters.to);
+    if (!Number.isNaN(to.getTime())) {
+      to.setUTCHours(23, 59, 59, 999);
+      dateQuery.$lte = to;
+    }
+  }
+
+  if (Object.keys(dateQuery).length > 0) {
+    query.createdAt = dateQuery;
+  }
+
+  if (filters.search) {
+    const regex = new RegExp(filters.search, 'i');
+    query.$or = [
+      { payoutId: regex },
+      { eventId: regex },
+      { vendorAuthId: regex },
+      { managerAuthId: regex },
+      { service: regex },
+      { status: regex },
+      { razorpayTransferId: regex },
+      { sourcePaymentId: regex },
     ];
   }
 
@@ -329,6 +462,371 @@ const buildServiceHeaders = (user = {}) => ({
   'x-user-role': user.role || 'ADMIN',
 });
 
+const normalizeRole = (user) => String(user?.role || '').trim().toUpperCase();
+
+const isRazorpayVendorPayoutEnabled = () => {
+  const raw = String(process.env.ENABLE_RAZORPAY_VENDOR_PAYOUTS || '').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
+};
+
+const getVendorPayoutMode = async () => {
+  const settings = await paymentSettingsService.getSettings();
+  const mode = String(settings?.vendorPayoutMode || 'DEMO').trim().toUpperCase();
+  if (mode === 'RAZORPAY' && isRazorpayVendorPayoutEnabled()) {
+    return 'RAZORPAY';
+  }
+  return 'DEMO';
+};
+
+const getRazorpayApiAuth = () => {
+  const keyId = process.env.RAZORPAY_KEY_ID;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+
+  if (!keyId || !keySecret) {
+    throw createApiError(500, 'Razorpay credentials are not configured');
+  }
+
+  return {
+    username: keyId,
+    password: keySecret,
+  };
+};
+
+const postRazorpayApi = async (path, payload) => {
+  const auth = getRazorpayApiAuth();
+
+  try {
+    const response = await axios.post(`${RAZORPAY_API_BASE_URL}${path}`, payload || {}, {
+      auth,
+      timeout: 15000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    return response.data;
+  } catch (error) {
+    throw normalizeRazorpayError(error, {
+      defaultStatusCode: 422,
+      defaultMessage: 'Razorpay API request failed',
+    });
+  }
+};
+
+const getRazorpayApi = async (path) => {
+  const auth = getRazorpayApiAuth();
+
+  try {
+    const response = await axios.get(`${RAZORPAY_API_BASE_URL}${path}`, {
+      auth,
+      timeout: 15000,
+    });
+
+    return response.data;
+  } catch (error) {
+    throw normalizeRazorpayError(error, {
+      defaultStatusCode: 422,
+      defaultMessage: 'Razorpay API request failed',
+    });
+  }
+};
+
+const getPublicVendorByAuthId = async (vendorAuthId) => {
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  if (!normalizedVendorAuthId) return null;
+
+  const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || 'http://vendor-service:8084';
+
+  try {
+    const response = await axios.get(`${vendorServiceUrl}/api/vendor/public/vendors`, {
+      timeout: 10000,
+      params: {
+        authIds: normalizedVendorAuthId,
+      },
+    });
+
+    const vendors = Array.isArray(response?.data?.data?.vendors) ? response.data.data.vendors : [];
+    return vendors.find((v) => String(v?.authId || '').trim() === normalizedVendorAuthId) || null;
+  } catch (_error) {
+    return null;
+  }
+};
+
+const getVendorApplicationContactByAuthId = async (vendorAuthId, user) => {
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  if (!normalizedVendorAuthId) return null;
+
+  const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || 'http://vendor-service:8084';
+
+  try {
+    // Internal service-to-service lookup.
+    // vendor-service trusts gateway-style headers, so we explicitly scope request to vendor authId.
+    const response = await axios.get(`${vendorServiceUrl}/api/vendor/me/application`, {
+      timeout: 10000,
+      headers: {
+        ...buildServiceHeaders(user),
+        'x-auth-id': normalizedVendorAuthId,
+        'x-user-role': 'VENDOR',
+      },
+    });
+
+    return response?.data?.data || null;
+  } catch (_error) {
+    return null;
+  }
+};
+
+const normalizePhoneForRazorpay = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const digitsOnly = raw.replace(/[^\d]/g, '');
+  if (digitsOnly.length < 10) return null;
+  return digitsOnly.slice(-10);
+};
+
+const syncVendorPayoutAccountStatus = async (accountDoc) => {
+  if (!accountDoc?.razorpayLinkedAccountId) return accountDoc;
+
+  const accountEntity = await getRazorpayApi(`/v2/accounts/${encodeURIComponent(accountDoc.razorpayLinkedAccountId)}`);
+  const statusRaw = String(accountEntity?.status || '').trim().toLowerCase();
+  const active = Boolean(accountEntity?.active) || statusRaw === 'activated';
+
+  accountDoc.accountStatus = statusRaw || null;
+  accountDoc.payoutsEnabled = Boolean(active);
+  accountDoc.onboardingStatus = active
+    ? 'COMPLETED'
+    : (statusRaw === 'rejected' ? 'REJECTED' : 'PENDING');
+  accountDoc.lastStatusSyncAt = new Date();
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    razorpayAccount: {
+      id: accountEntity?.id || accountDoc.razorpayLinkedAccountId,
+      status: accountEntity?.status || null,
+      active: Boolean(accountEntity?.active),
+    },
+  };
+
+  await accountDoc.save();
+  return accountDoc;
+};
+
+const ensureVendorPayoutAccount = async ({ vendorAuthId, user }) => {
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  if (!normalizedVendorAuthId) {
+    throw createApiError(400, 'vendorAuthId is required');
+  }
+
+  let accountDoc = await VendorPayoutAccount.findOne({ vendorAuthId: normalizedVendorAuthId });
+  if (accountDoc?.razorpayLinkedAccountId) {
+    return syncVendorPayoutAccountStatus(accountDoc);
+  }
+
+  const [userProfile, vendorProfile, vendorApplicationContact] = await Promise.all([
+    getUserProfileByAuthId(normalizedVendorAuthId, user),
+    getPublicVendorByAuthId(normalizedVendorAuthId),
+    getVendorApplicationContactByAuthId(normalizedVendorAuthId, user),
+  ]);
+
+  const contactEmail = String(
+    userProfile?.email
+    || vendorApplicationContact?.email
+    || (String(user?.authId || '').trim() === normalizedVendorAuthId ? user?.email : '')
+    || ''
+  ).trim();
+  const contactPhone = normalizePhoneForRazorpay(
+    userProfile?.phone
+    || vendorApplicationContact?.phone
+  );
+  const legalBusinessName = String(
+    vendorProfile?.businessName
+    || vendorApplicationContact?.businessName
+    || userProfile?.name
+    || `Vendor ${normalizedVendorAuthId}`
+  ).trim();
+
+  if (!contactEmail || !contactPhone) {
+    const missingFields = [
+      !contactEmail ? 'email' : null,
+      !contactPhone ? 'phone' : null,
+    ].filter(Boolean).join(' and ');
+
+    throw createApiError(
+      409,
+      `Vendor must have a valid ${missingFields || 'email and phone'} before Razorpay payout onboarding can begin`
+    );
+  }
+
+  const linkedAccount = await postRazorpayApi('/v2/accounts', {
+    email: contactEmail,
+    phone: contactPhone,
+    type: 'route',
+    reference_id: normalizedVendorAuthId,
+    legal_business_name: legalBusinessName.slice(0, 100),
+  });
+
+  const linkedAccountId = String(linkedAccount?.id || '').trim();
+  if (!linkedAccountId) {
+    throw createApiError(502, 'Failed to create Razorpay linked account');
+  }
+
+  if (!accountDoc) {
+    accountDoc = new VendorPayoutAccount({
+      vendorAuthId: normalizedVendorAuthId,
+    });
+  }
+
+  accountDoc.razorpayLinkedAccountId = linkedAccountId;
+  accountDoc.legalBusinessName = legalBusinessName;
+  accountDoc.contactEmail = contactEmail;
+  accountDoc.contactPhone = contactPhone;
+  accountDoc.onboardingStatus = 'PENDING';
+  accountDoc.payoutsEnabled = false;
+  accountDoc.accountStatus = String(linkedAccount?.status || '').trim().toLowerCase() || null;
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    linkedAccount: {
+      id: linkedAccountId,
+      createdAt: new Date().toISOString(),
+    },
+  };
+  await accountDoc.save();
+
+  return accountDoc;
+};
+
+const syncUserPayoutAccountStatus = async (accountDoc) => {
+  if (!accountDoc?.razorpayLinkedAccountId) return accountDoc;
+
+  const accountEntity = await getRazorpayApi(`/v2/accounts/${encodeURIComponent(accountDoc.razorpayLinkedAccountId)}`);
+  const statusRaw = String(accountEntity?.status || '').trim().toLowerCase();
+  const active = Boolean(accountEntity?.active) || statusRaw === 'activated';
+
+  accountDoc.accountStatus = statusRaw || null;
+  accountDoc.payoutsEnabled = Boolean(active);
+  accountDoc.onboardingStatus = active
+    ? 'COMPLETED'
+    : (statusRaw === 'rejected' ? 'REJECTED' : 'PENDING');
+  accountDoc.lastStatusSyncAt = new Date();
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    razorpayAccount: {
+      id: accountEntity?.id || accountDoc.razorpayLinkedAccountId,
+      status: accountEntity?.status || null,
+      active: Boolean(accountEntity?.active),
+    },
+  };
+
+  await accountDoc.save();
+  return accountDoc;
+};
+
+const ensureUserPayoutAccount = async ({ userAuthId, user }) => {
+  const normalizedUserAuthId = String(userAuthId || '').trim();
+  if (!normalizedUserAuthId) {
+    throw createApiError(400, 'userAuthId is required');
+  }
+
+  let accountDoc = await UserPayoutAccount.findOne({ userAuthId: normalizedUserAuthId });
+  if (accountDoc?.razorpayLinkedAccountId) {
+    return syncUserPayoutAccountStatus(accountDoc);
+  }
+
+  const userProfile = await getUserProfileByAuthId(normalizedUserAuthId, user);
+
+  const contactEmail = String(
+    userProfile?.email
+    || (String(user?.authId || '').trim() === normalizedUserAuthId ? user?.email : '')
+    || ''
+  ).trim();
+  const contactPhone = normalizePhoneForRazorpay(
+    userProfile?.phone
+  );
+  const legalBusinessName = String(
+    userProfile?.name
+    || `User ${normalizedUserAuthId}`
+  ).trim();
+
+  if (!contactEmail || !contactPhone) {
+    const missingFields = [
+      !contactEmail ? 'email' : null,
+      !contactPhone ? 'phone' : null,
+    ].filter(Boolean).join(' and ');
+
+    throw createApiError(
+      409,
+      `User must have a valid ${missingFields || 'email and phone'} before Razorpay payout onboarding can begin`
+    );
+  }
+
+  const linkedAccount = await postRazorpayApi('/v2/accounts', {
+    email: contactEmail,
+    phone: contactPhone,
+    type: 'route',
+    reference_id: normalizedUserAuthId,
+    legal_business_name: legalBusinessName.slice(0, 100),
+  });
+
+  const linkedAccountId = String(linkedAccount?.id || '').trim();
+  if (!linkedAccountId) {
+    throw createApiError(502, 'Failed to create Razorpay linked account for user payout');
+  }
+
+  if (!accountDoc) {
+    accountDoc = new UserPayoutAccount({
+      userAuthId: normalizedUserAuthId,
+    });
+  }
+
+  accountDoc.razorpayLinkedAccountId = linkedAccountId;
+  accountDoc.legalBusinessName = legalBusinessName;
+  accountDoc.contactEmail = contactEmail;
+  accountDoc.contactPhone = contactPhone;
+  accountDoc.onboardingStatus = 'PENDING';
+  accountDoc.payoutsEnabled = false;
+  accountDoc.accountStatus = String(linkedAccount?.status || '').trim().toLowerCase() || null;
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    linkedAccount: {
+      id: linkedAccountId,
+      createdAt: new Date().toISOString(),
+    },
+  };
+  await accountDoc.save();
+
+  return accountDoc;
+};
+
+const resolveVendorSlotForPayout = ({ selection, vendorAuthId, service }) => {
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  const requestedService = String(service || '').trim().toLowerCase();
+  const vendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+
+  const matches = vendors.filter((row) => {
+    const sameVendor = String(row?.vendorAuthId || '').trim() === normalizedVendorAuthId;
+    if (!sameVendor) return false;
+
+    const isAccepted = String(row?.status || '').trim().toUpperCase() === 'ACCEPTED';
+    if (!isAccepted) return false;
+
+    const quoted = Number(row?.vendorQuotedPrice || 0);
+    if (!(Boolean(row?.priceLocked) && Number.isFinite(quoted) && quoted > 0)) return false;
+
+    if (!requestedService) return true;
+    return String(row?.service || '').trim().toLowerCase() === requestedService;
+  });
+
+  if (matches.length === 0) {
+    throw createApiError(404, 'No accepted and locked vendor slot found for payout');
+  }
+
+  if (!requestedService && matches.length > 1) {
+    throw createApiError(400, 'service is required when a vendor has multiple accepted services');
+  }
+
+  return matches[0];
+};
+
 const formatInrFromPaise = (paise) => ((Number(paise || 0) || 0) / 100).toFixed(2);
 
 const formatReceiptAmount = (paise) => `INR ${formatInrFromPaise(paise)}`;
@@ -400,6 +898,36 @@ const createTransactionHistory = (order) => {
       status: 'REFUND_FAILED',
       date: order?.updatedAt ? new Date(order.updatedAt).toISOString() : new Date().toISOString(),
       desc: 'Refund attempt failed.',
+    });
+  }
+
+  return history.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+};
+
+const createVendorPayoutHistory = (payout) => {
+  const history = [];
+
+  if (payout?.createdAt) {
+    history.push({
+      status: 'INITIATED',
+      date: new Date(payout.createdAt).toISOString(),
+      desc: 'Vendor payout was initiated.',
+    });
+  }
+
+  if (String(payout?.status || '').trim().toUpperCase() === 'SUCCESS') {
+    history.push({
+      status: 'SUCCESS',
+      date: payout?.paidAt ? new Date(payout.paidAt).toISOString() : new Date(payout?.updatedAt || Date.now()).toISOString(),
+      desc: 'Vendor payout completed successfully.',
+    });
+  }
+
+  if (String(payout?.status || '').trim().toUpperCase() === 'FAILED') {
+    history.push({
+      status: 'FAILED',
+      date: payout?.updatedAt ? new Date(payout.updatedAt).toISOString() : new Date().toISOString(),
+      desc: payout?.failureReason || 'Vendor payout failed.',
     });
   }
 
@@ -737,6 +1265,9 @@ const getVendorSelectionForUser = async (eventId, user) => {
   const eventServiceUrl = process.env.EVENT_SERVICE_URL || 'http://event-service:8086';
   const response = await axios.get(`${eventServiceUrl}/vendor-selection/${encodeURIComponent(eventId)}`, {
     timeout: 10000,
+    params: {
+      includeVendors: 'true',
+    },
     headers: {
       'x-auth-id': user.authId,
       'x-user-id': user.userId || '',
@@ -763,6 +1294,75 @@ const getPlanningQuoteLatestForUser = async (eventId, user) => {
   });
 
   return response.data?.data;
+};
+
+const toVendorServiceKey = (vendorAuthId, service) => {
+  const vendorKey = String(vendorAuthId || '').trim().toLowerCase();
+  const serviceKey = String(service || '').trim().toLowerCase();
+  if (!vendorKey || !serviceKey) return null;
+  return `${vendorKey}::${serviceKey}`;
+};
+
+const resolvePlanningGrandTotalPaise = ({ quote, selection } = {}) => {
+  const selectionVendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  const pricingByKey = new Map();
+
+  for (const row of selectionVendors) {
+    const key = toVendorServiceKey(row?.vendorAuthId, row?.service);
+    if (!key) continue;
+
+    const quotedInrRaw = Number(row?.vendorQuotedPrice);
+    const quotedInr = Number.isFinite(quotedInrRaw) && quotedInrRaw > 0 ? quotedInrRaw : 0;
+    const isLocked = Boolean(row?.priceLocked) && quotedInr > 0;
+
+    pricingByKey.set(key, {
+      isLocked,
+      lockedTotalPaise: isLocked ? Math.max(0, Math.round(quotedInr * 100)) : 0,
+    });
+  }
+
+  const quoteItems = Array.isArray(quote?.items) ? quote.items : [];
+  let lineItemsTotalPaise = 0;
+
+  for (const item of quoteItems) {
+    const key = toVendorServiceKey(item?.vendorAuthId, item?.service);
+    const selectionPricing = key ? pricingByKey.get(key) : null;
+    const fallbackClientTotalPaise = Number(
+      item?.clientTotal?.minPaise ??
+      item?.clientTotal?.maxPaise ??
+      item?.vendorTotal?.minPaise ??
+      item?.vendorTotal?.maxPaise ??
+      0
+    );
+
+    const itemTotalPaise = (selectionPricing?.isLocked && Number(selectionPricing?.lockedTotalPaise) > 0)
+      ? Number(selectionPricing.lockedTotalPaise)
+      : fallbackClientTotalPaise;
+
+    if (Number.isFinite(itemTotalPaise) && itemTotalPaise > 0) {
+      lineItemsTotalPaise += itemTotalPaise;
+    }
+  }
+
+  const promotions = Array.isArray(quote?.promotions) ? quote.promotions : [];
+  const promotionsTotalPaise = promotions.reduce((sum, promotion) => {
+    const fee = Number(promotion?.feePaise || 0);
+    return sum + (Number.isFinite(fee) && fee > 0 ? fee : 0);
+  }, 0);
+
+  if (lineItemsTotalPaise > 0) {
+    return Math.max(0, lineItemsTotalPaise) + Math.max(0, promotionsTotalPaise);
+  }
+
+  const snapshotTotalPaise = Number(
+    quote?.clientGrandTotal?.minPaise ??
+    quote?.clientGrandTotal?.maxPaise ??
+    0
+  );
+
+  return Number.isFinite(snapshotTotalPaise) && snapshotTotalPaise > 0
+    ? snapshotTotalPaise
+    : 0;
 };
 
 const createOrder = async (payload, user) => {
@@ -832,6 +1432,25 @@ const createOrder = async (payload, user) => {
       if (Boolean(upstreamRecord.vendorConfirmationPaid)) {
         throw createApiError(409, 'Vendor confirmation is already paid for this event');
       }
+    } else if (orderType === 'PLANNING EVENT REMAINING FEE') {
+      const planningPlatformFeePaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
+      if (!planningPlatformFeePaid) {
+        throw createApiError(409, 'Planning fee must be paid before paying remaining amount');
+      }
+
+      const normalizedCategory = String(upstreamRecord.category || '').trim().toLowerCase();
+      if (normalizedCategory !== 'private') {
+        throw createApiError(409, 'Remaining payment is currently supported only for private planning events');
+      }
+
+      const normalizedStatus = String(upstreamRecord.status || '').trim().toUpperCase();
+      if (normalizedStatus !== 'COMPLETED') {
+        throw createApiError(409, 'Planning must be COMPLETED before paying remaining amount');
+      }
+
+      if (Boolean(upstreamRecord.remainingPaymentPaid)) {
+        throw createApiError(409, 'Remaining amount is already paid for this event');
+      }
     } else {
       const alreadyPaid = Boolean(upstreamRecord.platformFeePaid) || Boolean(upstreamRecord.isPaid);
       if (alreadyPaid) {
@@ -846,6 +1465,7 @@ const createOrder = async (payload, user) => {
   if (
     orderType !== 'PLANNING EVENT DEPOSIT FEE'
     && orderType !== 'PLANNING EVENT VENDOR CONFIRMATION FEE'
+    && orderType !== 'PLANNING EVENT REMAINING FEE'
     && orderType !== 'TICKET SALE'
   ) {
     const activeOrder = await PaymentOrder.findOne({
@@ -910,8 +1530,10 @@ const createOrder = async (payload, user) => {
     }
   } else if (orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE') {
     let quote;
+    let selection;
     try {
       quote = await getPlanningQuoteLatestForUser(value.eventId, user);
+      selection = await getVendorSelectionForUser(value.eventId, user);
     } catch (err) {
       if (isAxiosLikeError(err)) {
         throw normalizeAxiosError(err, { upstreamName: 'event-service' });
@@ -919,7 +1541,7 @@ const createOrder = async (payload, user) => {
       throw err;
     }
 
-    const clientGrandTotalMinPaise = Number(quote?.clientGrandTotal?.minPaise ?? 0);
+    const clientGrandTotalMinPaise = resolvePlanningGrandTotalPaise({ quote, selection });
     if (!Number.isFinite(clientGrandTotalMinPaise) || clientGrandTotalMinPaise <= 0) {
       throw createApiError(409, 'Cannot compute vendor confirmation amount without a locked quote');
     }
@@ -937,6 +1559,39 @@ const createOrder = async (payload, user) => {
     }
 
     amountInPaiseOverride = confirmationDuePaise;
+  } else if (orderType === 'PLANNING EVENT REMAINING FEE') {
+    let quote;
+    let selection;
+    try {
+      quote = await getPlanningQuoteLatestForUser(value.eventId, user);
+      selection = await getVendorSelectionForUser(value.eventId, user);
+    } catch (err) {
+      if (isAxiosLikeError(err)) {
+        throw normalizeAxiosError(err, { upstreamName: 'event-service' });
+      }
+      throw err;
+    }
+
+    const clientGrandTotalMinPaise = resolvePlanningGrandTotalPaise({ quote, selection });
+    if (!Number.isFinite(clientGrandTotalMinPaise) || clientGrandTotalMinPaise <= 0) {
+      throw createApiError(409, 'Cannot compute remaining amount without a locked quote');
+    }
+
+    const depositPaidAmountPaise = Number(upstreamRecord.depositPaidAmountPaise ?? 0);
+    const vendorConfirmationPaidAmountPaise = Number(upstreamRecord.vendorConfirmationPaidAmountPaise ?? 0);
+
+    const paidSoFarPaise =
+      (Number.isFinite(depositPaidAmountPaise) && depositPaidAmountPaise > 0 ? depositPaidAmountPaise : 0)
+      + (Number.isFinite(vendorConfirmationPaidAmountPaise) && vendorConfirmationPaidAmountPaise > 0
+        ? vendorConfirmationPaidAmountPaise
+        : 0);
+
+    const remainingDuePaise = Math.max(0, clientGrandTotalMinPaise - paidSoFarPaise);
+    if (!Number.isFinite(remainingDuePaise) || remainingDuePaise <= 0) {
+      throw createApiError(409, 'No remaining amount is due for this event');
+    }
+
+    amountInPaiseOverride = remainingDuePaise;
   } else {
     amountInInr = value.amount || Number(process.env.DEFAULT_PLATFORM_FEE_INR) || 15000;
   }
@@ -999,6 +1654,33 @@ const createOrder = async (payload, user) => {
     }
   }
 
+  if (orderType === 'PLANNING EVENT REMAINING FEE') {
+    const matchingActive = await PaymentOrder.findOne({
+      eventId: value.eventId,
+      authId: user.authId,
+      orderType,
+      status: 'CREATED',
+      currency,
+      amount: amountInPaise,
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (matchingActive) {
+      return {
+        eventId: matchingActive.eventId,
+        orderId: matchingActive._id,
+        razorpayOrderId: matchingActive.razorpayOrderId,
+        transactionId: matchingActive.transactionId,
+        orderType: matchingActive.orderType,
+        amount: matchingActive.amount,
+        currency: matchingActive.currency,
+        keyId: process.env.RAZORPAY_KEY_ID,
+        status: matchingActive.status,
+      };
+    }
+  }
+
   const razorpay = getRazorpayClient();
   let order;
   try {
@@ -1017,9 +1699,16 @@ const createOrder = async (payload, user) => {
           : {}),
         ...(orderType === 'PLANNING EVENT VENDOR CONFIRMATION FEE'
           ? {
-              computedFrom: 'planning-quote.clientGrandTotal.minPaise',
+              computedFrom: 'vendor-selection.lockedTotals+quote.promotions',
               vendorConfirmationPercent: 25,
               depositPaidAmountPaise: upstreamRecord.depositPaidAmountPaise,
+            }
+          : {}),
+        ...(orderType === 'PLANNING EVENT REMAINING FEE'
+          ? {
+              computedFrom: 'lockedQuoteGrandTotal-minus-paidMilestones',
+              depositPaidAmountPaise: upstreamRecord.depositPaidAmountPaise || 0,
+              vendorConfirmationPaidAmountPaise: upstreamRecord.vendorConfirmationPaidAmountPaise || 0,
             }
           : {}),
         ...orderNotes,
@@ -1351,57 +2040,60 @@ const getAdminLedger = async (rawQuery = {}, options = {}) => {
     throw createApiError(400, error.details[0].message);
   }
 
-  const query = buildAdminLedgerMongoQuery(value);
+  const orderQuery = buildAdminLedgerMongoQuery(value);
+  const payoutQuery = buildVendorPayoutLedgerMongoQuery(value);
   const page = Number(value.page || 1);
   const limit = Number(value.limit || 10);
   const skip = (page - 1) * limit;
   const sortField = value.sortBy || 'createdAt';
   const sortDirection = value.sortDir === 'asc' ? 1 : -1;
 
-  const [orders, total, summaryAgg, distinctAuthIds] = await Promise.all([
-    PaymentOrder.find(query)
-      .sort({ [sortField]: sortDirection })
-      .skip(skip)
-      .limit(limit)
-      .lean(),
-    PaymentOrder.countDocuments(query),
-    PaymentOrder.aggregate([
-      { $match: query },
-      {
-        $group: {
-          _id: null,
-          totalLedgerVolume: {
-            $sum: {
-              $cond: [
-                { $or: [{ $eq: ['$orderType', 'REFUND'] }, { $eq: ['$status', 'REFUNDED'] }] },
-                { $multiply: [{ $ifNull: ['$refundedAmount', '$amount'] }, -1] },
-                { $ifNull: ['$amount', 0] },
-              ],
-            },
-          },
-          pendingSettlements: {
-            $sum: {
-              $cond: [
-                { $eq: ['$status', 'CREATED'] },
-                { $ifNull: ['$amount', 0] },
-                0,
-              ],
-            },
-          },
-        },
-      },
-    ]),
-    PaymentOrder.distinct('authId', query),
+  const [orders, vendorPayouts] = await Promise.all([
+    PaymentOrder.find(orderQuery).lean(),
+    VendorPayout.find(payoutQuery).lean(),
   ]);
 
-  const summary = summaryAgg[0] || { totalLedgerVolume: 0, pendingSettlements: 0 };
+  const mappedOrders = orders.map(mapOrderToAdminLedgerRow);
+  const mappedPayouts = vendorPayouts.map(mapVendorPayoutToAdminLedgerRow);
+  const allTransactions = [...mappedOrders, ...mappedPayouts];
+
+  const getSortValue = (row) => {
+    if (sortField === 'amount') {
+      return Number(row?.amount || 0);
+    }
+    if (sortField === 'paidAt') {
+      return new Date(row?.paidAt || row?.createdAt || 0).getTime();
+    }
+    return new Date(row?.createdAt || 0).getTime();
+  };
+
+  allTransactions.sort((a, b) => {
+    const av = getSortValue(a);
+    const bv = getSortValue(b);
+    if (av === bv) return 0;
+    return sortDirection === 1 ? av - bv : bv - av;
+  });
+
+  const total = allTransactions.length;
+  const pagedTransactions = allTransactions.slice(skip, skip + limit);
   const totalPages = Math.max(1, Math.ceil(total / limit));
+
+  const totalLedgerVolume = allTransactions.reduce((sum, row) => sum + Number(row?.amount || 0), 0);
+  const pendingSettlements = allTransactions
+    .filter((row) => ['CREATED', 'INITIATED'].includes(String(row?.status || '').trim().toUpperCase()))
+    .reduce((sum, row) => sum + Math.abs(Number(row?.amount || 0)), 0);
+
+  const activeVendorIds = new Set(
+    allTransactions
+      .map((row) => String(row?.vendorId || '').trim())
+      .filter(Boolean)
+  );
 
   return {
     summary: {
-      totalLedgerVolume: Number(summary.totalLedgerVolume || 0),
-      pendingSettlements: Number(summary.pendingSettlements || 0),
-      activeVendors: Array.isArray(distinctAuthIds) ? distinctAuthIds.length : 0,
+      totalLedgerVolume: Number(totalLedgerVolume || 0),
+      pendingSettlements: Number(pendingSettlements || 0),
+      activeVendors: activeVendorIds.size,
       currency: 'INR',
     },
     pagination: {
@@ -1412,7 +2104,7 @@ const getAdminLedger = async (rawQuery = {}, options = {}) => {
       hasNext: page < totalPages,
       hasPrev: page > 1,
     },
-    transactions: orders.map(mapOrderToAdminLedgerRow),
+    transactions: pagedTransactions,
   };
 };
 
@@ -1423,11 +2115,16 @@ const getAdminLedgerTransactionById = async (transactionId) => {
   }
 
   const order = await PaymentOrder.findOne({ transactionId: normalizedTransactionId }).lean();
-  if (!order) {
-    throw createApiError(404, 'Transaction not found');
+  if (order) {
+    return mapOrderToAdminLedgerRow(order);
   }
 
-  return mapOrderToAdminLedgerRow(order);
+  const vendorPayout = await VendorPayout.findOne({ payoutId: normalizedTransactionId }).lean();
+  if (vendorPayout) {
+    return mapVendorPayoutToAdminLedgerRow(vendorPayout);
+  }
+
+  throw createApiError(404, 'Transaction not found');
 };
 
 const getAdminTransactionsByEventIdDetailed = async (eventId, user) => {
@@ -1436,39 +2133,70 @@ const getAdminTransactionsByEventIdDetailed = async (eventId, user) => {
     throw createApiError(400, 'Event ID is required');
   }
 
-  const orders = await PaymentOrder.find({ eventId: normalizedEventId })
-    .sort({ createdAt: -1 })
-    .lean();
+  const [orders, vendorPayouts] = await Promise.all([
+    PaymentOrder.find({ eventId: normalizedEventId }).lean(),
+    VendorPayout.find({ eventId: normalizedEventId }).lean(),
+  ]);
 
-  if (orders.length === 0) {
+  if (orders.length === 0 && vendorPayouts.length === 0) {
     return {
       event: await getEventDetailsByEventId(normalizedEventId, user),
       transactions: [],
     };
   }
 
-  const uniqueAuthIds = [...new Set(orders.map((row) => String(row.authId || '').trim()).filter(Boolean))];
+  const uniqueAuthIds = [...new Set([
+    ...orders.map((row) => String(row.authId || '').trim()),
+    ...vendorPayouts.map((row) => String(row.managerAuthId || '').trim()),
+  ].filter(Boolean))];
+
   const profiles = await Promise.all(uniqueAuthIds.map((authId) => getUserProfileByAuthId(authId, user)));
   const profileByAuthId = new Map(profiles.filter(Boolean).map((profile) => [String(profile.authId), profile]));
 
+  const orderTransactions = orders.map((row) => {
+    const profile = profileByAuthId.get(String(row.authId || '').trim()) || null;
+    return {
+      transactionId: row.transactionId,
+      eventId: row.eventId,
+      authId: row.authId,
+      payer: profile,
+      type: row.orderType,
+      status: row.status,
+      amount: normalizeLedgerAmount(row),
+      currency: row.currency || 'INR',
+      createdAt: row.createdAt,
+      paidAt: row.paidAt,
+      refundedAt: row.refundedAt,
+    };
+  });
+
+  const payoutTransactions = vendorPayouts.map((row) => {
+    const managerProfile = profileByAuthId.get(String(row.managerAuthId || '').trim()) || null;
+    return {
+      transactionId: row.payoutId,
+      eventId: row.eventId,
+      authId: row.managerAuthId || row.vendorAuthId,
+      payer: managerProfile,
+      type: 'VENDOR PAYOUT',
+      status: row.status,
+      amount: -Math.abs(Number(row.payoutAmountPaise || 0) || 0),
+      currency: row.currency || 'INR',
+      createdAt: row.createdAt,
+      paidAt: row.paidAt,
+      refundedAt: null,
+    };
+  });
+
+  const transactions = [...orderTransactions, ...payoutTransactions]
+    .sort((a, b) => {
+      const at = new Date(a?.createdAt || 0).getTime();
+      const bt = new Date(b?.createdAt || 0).getTime();
+      return bt - at;
+    });
+
   return {
     event: await getEventDetailsByEventId(normalizedEventId, user),
-    transactions: orders.map((row) => {
-      const profile = profileByAuthId.get(String(row.authId || '').trim()) || null;
-      return {
-        transactionId: row.transactionId,
-        eventId: row.eventId,
-        authId: row.authId,
-        payer: profile,
-        type: row.orderType,
-        status: row.status,
-        amount: normalizeLedgerAmount(row),
-        currency: row.currency || 'INR',
-        createdAt: row.createdAt,
-        paidAt: row.paidAt,
-        refundedAt: row.refundedAt,
-      };
-    }),
+    transactions,
   };
 };
 
@@ -1479,58 +2207,110 @@ const getAdminTransactionDetails = async (transactionId, user) => {
   }
 
   const order = await PaymentOrder.findOne({ transactionId: normalizedTransactionId }).lean();
-  if (!order) {
+  if (order) {
+    const [eventInfo, payer] = await Promise.all([
+      getEventDetailsByEventId(order.eventId, user),
+      getUserProfileByAuthId(order.authId, user),
+    ]);
+
+    const grossAmount = Math.abs(Number(order.refundedAmount ?? order.amount ?? 0) || 0);
+    const platformFee = Math.round(grossAmount * 0.025);
+    const tax = Math.round(platformFee * 0.18);
+    const signedAmount = normalizeLedgerAmount(order);
+    const settlementAmount = signedAmount >= 0 ? grossAmount - platformFee - tax : -grossAmount;
+
+    const eventTransactionsResult = await getAdminTransactionsByEventIdDetailed(order.eventId, user);
+
+    return {
+      transaction: {
+        transactionId: order.transactionId,
+        eventId: order.eventId,
+        authId: order.authId,
+        type: order.orderType,
+        status: order.status,
+        amount: signedAmount,
+        grossAmount,
+        currency: order.currency || 'INR',
+        platformFee,
+        tax,
+        settlementAmount,
+        createdAt: order.createdAt,
+        paidAt: order.paidAt,
+        refundedAt: order.refundedAt,
+        vendor: {
+          name: order?.notes?.vendorName || order?.notes?.businessName || order?.notes?.vendor || 'System Auto',
+          id: order?.notes?.vendorId || order?.notes?.vendorAuthId || null,
+          email: order?.notes?.vendorEmail || null,
+        },
+        payer: payer || {
+          authId: order.authId,
+          name: null,
+          email: null,
+          phone: null,
+        },
+        event: eventInfo,
+        references: {
+          systemReference: order.razorpayPaymentId || order.razorpayOrderId || order.transactionId,
+          razorpayOrderId: order.razorpayOrderId || null,
+          razorpayPaymentId: order.razorpayPaymentId || null,
+          razorpayRefundId: order.razorpayRefundId || null,
+        },
+        history: createTransactionHistory(order),
+      },
+      eventTransactions: eventTransactionsResult.transactions,
+    };
+  }
+
+  const payout = await VendorPayout.findOne({ payoutId: normalizedTransactionId }).lean();
+  if (!payout) {
     throw createApiError(404, 'Transaction not found');
   }
 
-  const [eventInfo, payer] = await Promise.all([
-    getEventDetailsByEventId(order.eventId, user),
-    getUserProfileByAuthId(order.authId, user),
+  const [eventInfo, managerProfile, vendorProfile] = await Promise.all([
+    getEventDetailsByEventId(payout.eventId, user),
+    getUserProfileByAuthId(payout.managerAuthId, user),
+    getUserProfileByAuthId(payout.vendorAuthId, user),
   ]);
 
-  const grossAmount = Math.abs(Number(order.refundedAmount ?? order.amount ?? 0) || 0);
-  const platformFee = Math.round(grossAmount * 0.025);
-  const tax = Math.round(platformFee * 0.18);
-  const signedAmount = normalizeLedgerAmount(order);
-  const settlementAmount = signedAmount >= 0 ? grossAmount - platformFee - tax : -grossAmount;
-
-  const eventTransactionsResult = await getAdminTransactionsByEventIdDetailed(order.eventId, user);
+  const grossAmount = Math.abs(Number(payout.payoutAmountPaise || 0) || 0);
+  const signedAmount = -grossAmount;
+  const eventTransactionsResult = await getAdminTransactionsByEventIdDetailed(payout.eventId, user);
 
   return {
     transaction: {
-      transactionId: order.transactionId,
-      eventId: order.eventId,
-      authId: order.authId,
-      type: order.orderType,
-      status: order.status,
+      transactionId: payout.payoutId,
+      eventId: payout.eventId,
+      authId: payout.managerAuthId || payout.vendorAuthId,
+      type: 'VENDOR PAYOUT',
+      status: payout.status,
       amount: signedAmount,
       grossAmount,
-      currency: order.currency || 'INR',
-      platformFee,
-      tax,
-      settlementAmount,
-      createdAt: order.createdAt,
-      paidAt: order.paidAt,
-      refundedAt: order.refundedAt,
+      currency: payout.currency || 'INR',
+      platformFee: 0,
+      tax: 0,
+      settlementAmount: signedAmount,
+      createdAt: payout.createdAt,
+      paidAt: payout.paidAt,
+      refundedAt: null,
       vendor: {
-        name: order?.notes?.vendorName || order?.notes?.businessName || order?.notes?.vendor || 'System Auto',
-        id: order?.notes?.vendorId || order?.notes?.vendorAuthId || null,
-        email: order?.notes?.vendorEmail || null,
+        name: payout?.notes?.vendorName || vendorProfile?.name || payout.vendorAuthId || 'Vendor',
+        id: payout.vendorAuthId || null,
+        email: vendorProfile?.email || null,
       },
-      payer: payer || {
-        authId: order.authId,
-        name: null,
+      payer: managerProfile || {
+        authId: payout.managerAuthId || null,
+        name: payout.managerAuthId || null,
         email: null,
         phone: null,
       },
       event: eventInfo,
       references: {
-        systemReference: order.razorpayPaymentId || order.razorpayOrderId || order.transactionId,
-        razorpayOrderId: order.razorpayOrderId || null,
-        razorpayPaymentId: order.razorpayPaymentId || null,
-        razorpayRefundId: order.razorpayRefundId || null,
+        systemReference: payout.razorpayTransferId || payout.sourcePaymentId || payout.payoutId,
+        razorpayOrderId: null,
+        razorpayPaymentId: payout.sourcePaymentId || null,
+        razorpayRefundId: null,
       },
-      history: createTransactionHistory(order),
+      history: createVendorPayoutHistory(payout),
     },
     eventTransactions: eventTransactionsResult.transactions,
   };
@@ -1669,6 +2449,799 @@ const exportAdminTransactionReceiptPdf = async (transactionId, user) => {
   return buildAdminReceiptPdfBuffer(details);
 };
 
+const createVendorPayoutOnboardingLink = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'VENDOR') {
+    throw createApiError(403, 'Only vendors can create payout onboarding links');
+  }
+
+  const { value, error } = vendorPayoutOnboardingLinkSchema.validate(payload || {});
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+  if (payoutMode === 'DEMO') {
+    throw createApiError(
+      409,
+      'Vendor payouts are currently in DEMO mode. Ask admin to switch payout mode to RAZORPAY in Admin Settings.'
+    );
+  }
+
+  const accountDoc = await ensureVendorPayoutAccount({ vendorAuthId: user.authId, user });
+
+  const callbackUrl = String(
+    value?.callbackUrl
+    || process.env.RAZORPAY_ROUTE_ONBOARDING_CALLBACK_URL
+    || `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/vendor/account-settings`
+  ).trim();
+
+  const linkPayload = {
+    account_id: accountDoc.razorpayLinkedAccountId,
+    reference_id: `vendor-${user.authId}-${Date.now()}`,
+    amount: 100,
+    currency: 'INR',
+    description: 'Complete vendor payout onboarding',
+    callback_url: callbackUrl,
+    callback_method: 'get',
+  };
+
+  const accountLink = await postRazorpayApi('/v2/account_links', linkPayload);
+  const shortUrl = String(accountLink?.short_url || accountLink?.url || '').trim();
+
+  if (!shortUrl) {
+    throw createApiError(502, 'Failed to create Razorpay onboarding link');
+  }
+
+  accountDoc.lastOnboardingLinkAt = new Date();
+  accountDoc.onboardingStatus = 'PENDING';
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    lastOnboardingLink: {
+      createdAt: new Date().toISOString(),
+      callbackUrl,
+      referenceId: linkPayload.reference_id,
+    },
+  };
+  await accountDoc.save();
+
+  return {
+    vendorAuthId: accountDoc.vendorAuthId,
+    linkedAccountId: accountDoc.razorpayLinkedAccountId,
+    onboardingStatus: accountDoc.onboardingStatus,
+    payoutsEnabled: Boolean(accountDoc.payoutsEnabled),
+    vendorPayoutMode: payoutMode,
+    onboardingUrl: shortUrl,
+  };
+};
+
+const getVendorPayoutOnboardingStatus = async (user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'VENDOR') {
+    throw createApiError(403, 'Only vendors can access payout onboarding status');
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+  if (payoutMode === 'DEMO') {
+    return {
+      vendorAuthId: user.authId,
+      linkedAccountId: null,
+      onboardingStatus: 'COMPLETED',
+      payoutsEnabled: true,
+      accountStatus: 'DEMO',
+      vendorPayoutMode: payoutMode,
+      updatedAt: null,
+    };
+  }
+
+  let accountDoc = await VendorPayoutAccount.findOne({ vendorAuthId: user.authId });
+  if (!accountDoc) {
+    return {
+      vendorAuthId: user.authId,
+      linkedAccountId: null,
+      onboardingStatus: 'NOT_STARTED',
+      payoutsEnabled: false,
+      accountStatus: null,
+      vendorPayoutMode: payoutMode,
+      updatedAt: null,
+    };
+  }
+
+  if (accountDoc.razorpayLinkedAccountId) {
+    accountDoc = await syncVendorPayoutAccountStatus(accountDoc);
+  }
+
+  return {
+    vendorAuthId: accountDoc.vendorAuthId,
+    linkedAccountId: accountDoc.razorpayLinkedAccountId,
+    onboardingStatus: accountDoc.onboardingStatus,
+    payoutsEnabled: Boolean(accountDoc.payoutsEnabled),
+    accountStatus: accountDoc.accountStatus,
+    vendorPayoutMode: payoutMode,
+    updatedAt: accountDoc.updatedAt,
+  };
+};
+
+const listVendorPayoutsForEvent = async (eventId, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'ADMIN' && role !== 'MANAGER') {
+    throw createApiError(403, 'Only admins and managers can view vendor payouts');
+  }
+
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const payouts = await VendorPayout.find({ eventId: normalizedEventId })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const derivePayoutMode = (row) => {
+    const notesMode = String(row?.notes?.payoutMode || '').trim().toUpperCase();
+    if (notesMode === 'DEMO' || notesMode === 'RAZORPAY') return notesMode;
+
+    if (String(row?.linkedAccountId || '').trim().toUpperCase() === 'DEMO') return 'DEMO';
+
+    const transferId = String(row?.razorpayTransferId || '').trim().toLowerCase();
+    if (transferId.startsWith('demo_')) return 'DEMO';
+
+    return 'RAZORPAY';
+  };
+
+  return {
+    eventId: normalizedEventId,
+    payouts: payouts.map((row) => ({
+      payoutId: row.payoutId,
+      eventId: row.eventId,
+      vendorAuthId: row.vendorAuthId,
+      service: row.service,
+      serviceId: row.serviceId || null,
+      managerAuthId: row.managerAuthId,
+      status: row.status,
+      currency: row.currency || 'INR',
+      lockedAmountPaise: Number(row.lockedAmountPaise || 0),
+      commissionAmountPaise: Number(row.commissionAmountPaise || 0),
+      payoutAmountPaise: Number(row.payoutAmountPaise || 0),
+      payoutMode: derivePayoutMode(row),
+      sourcePaymentId: row.sourcePaymentId || null,
+      razorpayTransferId: row.razorpayTransferId || null,
+      failureReason: row.failureReason || null,
+      paidAt: row.paidAt || null,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    })),
+  };
+};
+
+const listVendorPayoutsForVendor = async (vendorAuthId, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'ADMIN' && role !== 'MANAGER' && role !== 'VENDOR') {
+    throw createApiError(403, 'Only admins, managers, and vendors can view vendor payouts');
+  }
+
+  const normalizedVendorAuthId = String(vendorAuthId || '').trim();
+  if (!normalizedVendorAuthId) {
+    throw createApiError(400, 'vendorAuthId is required');
+  }
+
+  if (role === 'VENDOR' && String(user.authId || '').trim() !== normalizedVendorAuthId) {
+    throw createApiError(403, 'Vendors can only view their own payouts');
+  }
+
+  const payouts = await VendorPayout.find({ vendorAuthId: normalizedVendorAuthId })
+    .sort({ paidAt: -1, createdAt: -1 })
+    .lean();
+
+  const derivePayoutMode = (row) => {
+    const notesMode = String(row?.notes?.payoutMode || '').trim().toUpperCase();
+    if (notesMode === 'DEMO' || notesMode === 'RAZORPAY') return notesMode;
+
+    if (String(row?.linkedAccountId || '').trim().toUpperCase() === 'DEMO') return 'DEMO';
+
+    const transferId = String(row?.razorpayTransferId || '').trim().toLowerCase();
+    if (transferId.startsWith('demo_')) return 'DEMO';
+
+    return 'RAZORPAY';
+  };
+
+  return {
+    vendorAuthId: normalizedVendorAuthId,
+    payouts: payouts.map((row) => ({
+      payoutId: row.payoutId,
+      eventId: row.eventId,
+      vendorAuthId: row.vendorAuthId,
+      service: row.service,
+      serviceId: row.serviceId || null,
+      managerAuthId: row.managerAuthId,
+      status: row.status,
+      currency: row.currency || 'INR',
+      lockedAmountPaise: Number(row.lockedAmountPaise || 0),
+      commissionAmountPaise: Number(row.commissionAmountPaise || 0),
+      payoutAmountPaise: Number(row.payoutAmountPaise || 0),
+      payoutMode: derivePayoutMode(row),
+      sourcePaymentId: row.sourcePaymentId || null,
+      razorpayTransferId: row.razorpayTransferId || null,
+      failureReason: row.failureReason || null,
+      paidAt: row.paidAt || null,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    })),
+  };
+};
+
+const releaseVendorPayout = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'ADMIN' && role !== 'MANAGER') {
+    throw createApiError(403, 'Only admins and managers can release vendor payouts');
+  }
+
+  const { value, error } = vendorPayoutReleaseSchema.validate(payload || {});
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+
+  let selection;
+  try {
+    selection = await getVendorSelectionForUser(value.eventId, user);
+  } catch (err) {
+    if (isAxiosLikeError(err)) {
+      throw normalizeAxiosError(err, { upstreamName: 'event-service' });
+    }
+    throw err;
+  }
+
+  const slot = resolveVendorSlotForPayout({
+    selection,
+    vendorAuthId: value.vendorAuthId,
+    service: value.service,
+  });
+
+  const serviceLabel = String(slot?.service || '').trim();
+  const existingPayout = await VendorPayout.findOne({
+    eventId: value.eventId,
+    vendorAuthId: value.vendorAuthId,
+    service: serviceLabel,
+  }).lean();
+
+  if (existingPayout) {
+    if (existingPayout.status === 'SUCCESS' || existingPayout.status === 'INITIATED') {
+      return {
+        alreadyProcessed: true,
+        payoutMode,
+        payout: {
+          payoutId: existingPayout.payoutId,
+          eventId: existingPayout.eventId,
+          vendorAuthId: existingPayout.vendorAuthId,
+          service: existingPayout.service,
+          status: existingPayout.status,
+          payoutAmountPaise: Number(existingPayout.payoutAmountPaise || 0),
+          commissionAmountPaise: Number(existingPayout.commissionAmountPaise || 0),
+          lockedAmountPaise: Number(existingPayout.lockedAmountPaise || 0),
+          razorpayTransferId: existingPayout.razorpayTransferId || null,
+          paidAt: existingPayout.paidAt || null,
+          failureReason: existingPayout.failureReason || null,
+        },
+      };
+    }
+
+    throw createApiError(409, 'A failed payout record already exists for this vendor service; please contact admin support');
+  }
+
+  const quotedInr = Number(slot?.vendorQuotedPrice || 0);
+  const commissionInr = Number(slot?.commissionAmount || 0);
+  const lockedAmountPaise = Math.max(0, Math.round(quotedInr * 100));
+  const commissionAmountPaise = Math.max(0, Math.round(commissionInr * 100));
+  const payoutAmountPaise = Math.max(0, lockedAmountPaise - commissionAmountPaise);
+
+  if (!Number.isFinite(payoutAmountPaise) || payoutAmountPaise <= 0) {
+    throw createApiError(409, 'Vendor payout amount is zero for this service');
+  }
+
+  if (payoutMode === 'DEMO') {
+    const sourceOrder = await PaymentOrder.findOne({
+      eventId: value.eventId,
+      status: 'PAID',
+      orderType: { $ne: 'REFUND' },
+    })
+      .sort({ paidAt: -1, createdAt: -1 })
+      .lean();
+
+    const payoutDoc = await VendorPayout.create({
+      eventId: value.eventId,
+      vendorAuthId: value.vendorAuthId,
+      service: serviceLabel,
+      serviceId: slot?.serviceId ? String(slot.serviceId).trim() : null,
+      managerAuthId: user.authId,
+      linkedAccountId: 'DEMO',
+      sourcePaymentId: sourceOrder?.razorpayPaymentId || sourceOrder?.transactionId || 'DEMO',
+      lockedAmountPaise,
+      commissionAmountPaise,
+      payoutAmountPaise,
+      currency: 'INR',
+      status: 'SUCCESS',
+      razorpayTransferId: `demo_${Date.now()}`,
+      paidAt: new Date(),
+      notes: {
+        payoutMode: 'DEMO',
+        vendorQuotedPriceInr: quotedInr,
+        commissionAmountInr: commissionInr,
+        sourcePaymentOrderType: sourceOrder?.orderType || null,
+        sourcePaymentOrderId: sourceOrder?.razorpayOrderId || null,
+        sourceTransactionId: sourceOrder?.transactionId || null,
+      },
+    });
+
+    try {
+      await publishEvent('VENDOR_PAYOUT_SUCCESS', {
+        eventId: payoutDoc.eventId,
+        payoutId: payoutDoc.payoutId,
+        vendorAuthId: payoutDoc.vendorAuthId,
+        service: payoutDoc.service,
+        amount: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        commissionAmount: payoutDoc.commissionAmountPaise,
+        lockedAmount: payoutDoc.lockedAmountPaise,
+        managerAuthId: payoutDoc.managerAuthId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        payoutMode: 'DEMO',
+        paidAt: payoutDoc.paidAt?.toISOString?.() || new Date().toISOString(),
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish VENDOR_PAYOUT_SUCCESS event:', kafkaError);
+    }
+
+    return {
+      alreadyProcessed: false,
+      payoutMode: 'DEMO',
+      payout: {
+        payoutId: payoutDoc.payoutId,
+        eventId: payoutDoc.eventId,
+        vendorAuthId: payoutDoc.vendorAuthId,
+        service: payoutDoc.service,
+        serviceId: payoutDoc.serviceId || null,
+        managerAuthId: payoutDoc.managerAuthId,
+        status: payoutDoc.status,
+        lockedAmountPaise: payoutDoc.lockedAmountPaise,
+        commissionAmountPaise: payoutDoc.commissionAmountPaise,
+        payoutAmountPaise: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        paidAt: payoutDoc.paidAt,
+      },
+    };
+  }
+
+  const accountDoc = await ensureVendorPayoutAccount({ vendorAuthId: value.vendorAuthId, user });
+  const syncedAccountDoc = await syncVendorPayoutAccountStatus(accountDoc);
+  if (!syncedAccountDoc.payoutsEnabled) {
+    throw createApiError(409, 'Vendor payout onboarding is incomplete in Razorpay');
+  }
+
+  const sourceOrder = await PaymentOrder.findOne({
+    eventId: value.eventId,
+    status: 'PAID',
+    orderType: { $ne: 'REFUND' },
+    razorpayPaymentId: { $exists: true, $nin: [null, ''] },
+  })
+    .sort({ paidAt: -1, createdAt: -1 })
+    .lean();
+
+  if (!sourceOrder?.razorpayPaymentId) {
+    throw createApiError(409, 'Cannot release vendor payout until at least one captured payment exists for this event');
+  }
+
+  const payoutDoc = await VendorPayout.create({
+    eventId: value.eventId,
+    vendorAuthId: value.vendorAuthId,
+    service: serviceLabel,
+    serviceId: slot?.serviceId ? String(slot.serviceId).trim() : null,
+    managerAuthId: user.authId,
+    linkedAccountId: syncedAccountDoc.razorpayLinkedAccountId,
+    sourcePaymentId: sourceOrder.razorpayPaymentId,
+    lockedAmountPaise,
+    commissionAmountPaise,
+    payoutAmountPaise,
+    currency: 'INR',
+    status: 'INITIATED',
+    notes: {
+      vendorQuotedPriceInr: quotedInr,
+      commissionAmountInr: commissionInr,
+      sourcePaymentOrderType: sourceOrder.orderType,
+      sourcePaymentOrderId: sourceOrder.razorpayOrderId,
+      sourceTransactionId: sourceOrder.transactionId,
+    },
+  });
+
+  try {
+    const transferResult = await postRazorpayApi(`/v1/payments/${encodeURIComponent(sourceOrder.razorpayPaymentId)}/transfers`, {
+      transfers: [
+        {
+          account: syncedAccountDoc.razorpayLinkedAccountId,
+          amount: payoutAmountPaise,
+          currency: 'INR',
+          notes: {
+            eventId: String(value.eventId),
+            vendorAuthId: String(value.vendorAuthId),
+            service: serviceLabel,
+            payoutId: payoutDoc.payoutId,
+          },
+        },
+      ],
+    });
+
+    const firstTransfer = Array.isArray(transferResult?.items) ? transferResult.items[0] : null;
+    const transferId = String(firstTransfer?.id || '').trim();
+    if (!transferId) {
+      throw createApiError(502, 'Razorpay did not return a transfer id for payout');
+    }
+
+    payoutDoc.status = 'SUCCESS';
+    payoutDoc.razorpayTransferId = transferId;
+    payoutDoc.paidAt = new Date();
+    payoutDoc.failureReason = null;
+    await payoutDoc.save();
+
+    try {
+      await publishEvent('VENDOR_PAYOUT_SUCCESS', {
+        eventId: payoutDoc.eventId,
+        payoutId: payoutDoc.payoutId,
+        vendorAuthId: payoutDoc.vendorAuthId,
+        service: payoutDoc.service,
+        amount: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        commissionAmount: payoutDoc.commissionAmountPaise,
+        lockedAmount: payoutDoc.lockedAmountPaise,
+        managerAuthId: payoutDoc.managerAuthId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        payoutMode: 'RAZORPAY',
+        paidAt: payoutDoc.paidAt?.toISOString?.() || new Date().toISOString(),
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish VENDOR_PAYOUT_SUCCESS event:', kafkaError);
+    }
+
+    return {
+      alreadyProcessed: false,
+      payoutMode: 'RAZORPAY',
+      payout: {
+        payoutId: payoutDoc.payoutId,
+        eventId: payoutDoc.eventId,
+        vendorAuthId: payoutDoc.vendorAuthId,
+        service: payoutDoc.service,
+        serviceId: payoutDoc.serviceId || null,
+        managerAuthId: payoutDoc.managerAuthId,
+        status: payoutDoc.status,
+        lockedAmountPaise: payoutDoc.lockedAmountPaise,
+        commissionAmountPaise: payoutDoc.commissionAmountPaise,
+        payoutAmountPaise: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        paidAt: payoutDoc.paidAt,
+      },
+    };
+  } catch (errorOrRazorpay) {
+    payoutDoc.status = 'FAILED';
+    payoutDoc.failureReason = String(errorOrRazorpay?.message || 'Payout transfer failed').slice(0, 600);
+    await payoutDoc.save();
+    throw errorOrRazorpay;
+  }
+};
+
+const createUserPayoutOnboardingLink = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'USER') {
+    throw createApiError(403, 'Only users can create payout onboarding links');
+  }
+
+  const { value, error } = userPayoutOnboardingLinkSchema.validate(payload || {});
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+  if (payoutMode === 'DEMO') {
+    throw createApiError(
+      409,
+      'User payouts are currently in DEMO mode. Ask admin to switch payout mode to RAZORPAY in Admin Settings.'
+    );
+  }
+
+  const accountDoc = await ensureUserPayoutAccount({ userAuthId: user.authId, user });
+
+  const callbackUrl = String(
+    value?.callbackUrl
+    || process.env.RAZORPAY_ROUTE_ONBOARDING_CALLBACK_URL
+    || `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/user/profile`
+  ).trim();
+
+  const linkPayload = {
+    account_id: accountDoc.razorpayLinkedAccountId,
+    reference_id: `user-${user.authId}-${Date.now()}`,
+    amount: 100,
+    currency: 'INR',
+    description: 'Complete user payout onboarding',
+    callback_url: callbackUrl,
+    callback_method: 'get',
+  };
+
+  const accountLink = await postRazorpayApi('/v2/account_links', linkPayload);
+  const shortUrl = String(accountLink?.short_url || accountLink?.url || '').trim();
+
+  if (!shortUrl) {
+    throw createApiError(502, 'Failed to create Razorpay onboarding link');
+  }
+
+  accountDoc.lastOnboardingLinkAt = new Date();
+  accountDoc.onboardingStatus = 'PENDING';
+  accountDoc.metadata = {
+    ...(accountDoc.metadata || {}),
+    lastOnboardingLink: {
+      createdAt: new Date().toISOString(),
+      callbackUrl,
+      referenceId: linkPayload.reference_id,
+    },
+  };
+  await accountDoc.save();
+
+  return {
+    userAuthId: accountDoc.userAuthId,
+    linkedAccountId: accountDoc.razorpayLinkedAccountId,
+    onboardingStatus: accountDoc.onboardingStatus,
+    payoutsEnabled: Boolean(accountDoc.payoutsEnabled),
+    vendorPayoutMode: payoutMode,
+    onboardingUrl: shortUrl,
+  };
+};
+
+const getUserPayoutOnboardingStatus = async (user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'USER') {
+    throw createApiError(403, 'Only users can access payout onboarding status');
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+  if (payoutMode === 'DEMO') {
+    return {
+      userAuthId: user.authId,
+      linkedAccountId: null,
+      onboardingStatus: 'COMPLETED',
+      payoutsEnabled: true,
+      accountStatus: 'DEMO',
+      vendorPayoutMode: payoutMode,
+      updatedAt: null,
+    };
+  }
+
+  let accountDoc = await UserPayoutAccount.findOne({ userAuthId: user.authId });
+  if (!accountDoc) {
+    return {
+      userAuthId: user.authId,
+      linkedAccountId: null,
+      onboardingStatus: 'NOT_STARTED',
+      payoutsEnabled: false,
+      accountStatus: null,
+      vendorPayoutMode: payoutMode,
+      updatedAt: null,
+    };
+  }
+
+  if (accountDoc.razorpayLinkedAccountId) {
+    accountDoc = await syncUserPayoutAccountStatus(accountDoc);
+  }
+
+  return {
+    userAuthId: accountDoc.userAuthId,
+    linkedAccountId: accountDoc.razorpayLinkedAccountId,
+    onboardingStatus: accountDoc.onboardingStatus,
+    payoutsEnabled: Boolean(accountDoc.payoutsEnabled),
+    accountStatus: accountDoc.accountStatus,
+    vendorPayoutMode: payoutMode,
+    updatedAt: accountDoc.updatedAt,
+  };
+};
+
+const releaseUserGeneratedRevenuePayout = async (payload, user) => {
+  if (!user?.authId) {
+    throw createApiError(401, 'User authentication information missing');
+  }
+
+  const role = normalizeRole(user);
+  if (role !== 'ADMIN' && role !== 'MANAGER') {
+    throw createApiError(403, 'Only admins and managers can release user generated revenue payouts');
+  }
+
+  const { value, error } = userRevenuePayoutReleaseSchema.validate(payload || {});
+  if (error) {
+    throw createApiError(400, error.details[0].message);
+  }
+
+  const payoutMode = await getVendorPayoutMode();
+  if (payoutMode !== 'RAZORPAY') {
+    throw createApiError(
+      409,
+      'User generated revenue payout in live mode requires admin payout setting RAZORPAY'
+    );
+  }
+
+  const existingPayout = await UserRevenuePayout.findOne({
+    eventId: value.eventId,
+    userAuthId: value.userAuthId,
+  }).lean();
+
+  if (existingPayout) {
+    if (existingPayout.status === 'SUCCESS' || existingPayout.status === 'INITIATED') {
+      return {
+        alreadyProcessed: true,
+        payoutMode,
+        payout: {
+          payoutId: existingPayout.payoutId,
+          eventId: existingPayout.eventId,
+          userAuthId: existingPayout.userAuthId,
+          status: existingPayout.status,
+          payoutAmountPaise: Number(existingPayout.payoutAmountPaise || 0),
+          generatedRevenuePaise: Number(existingPayout.generatedRevenuePaise || 0),
+          totalVendorCostPaise: Number(existingPayout.totalVendorCostPaise || 0),
+          totalFeesPaise: Number(existingPayout.totalFeesPaise || 0),
+          razorpayTransferId: existingPayout.razorpayTransferId || null,
+          paidAt: existingPayout.paidAt || null,
+          failureReason: existingPayout.failureReason || null,
+        },
+      };
+    }
+
+    throw createApiError(409, 'A failed payout record already exists for this event user payout; please contact admin support');
+  }
+
+  const accountDoc = await ensureUserPayoutAccount({ userAuthId: value.userAuthId, user });
+  const syncedAccountDoc = await syncUserPayoutAccountStatus(accountDoc);
+  if (!syncedAccountDoc.payoutsEnabled) {
+    throw createApiError(409, 'User payout onboarding is incomplete in Razorpay');
+  }
+
+  const sourceOrder = await PaymentOrder.findOne({
+    eventId: value.eventId,
+    status: 'PAID',
+    orderType: { $ne: 'REFUND' },
+    razorpayPaymentId: { $exists: true, $nin: [null, ''] },
+  })
+    .sort({ paidAt: -1, createdAt: -1 })
+    .lean();
+
+  if (!sourceOrder?.razorpayPaymentId) {
+    throw createApiError(409, 'Cannot release user payout until at least one captured payment exists for this event');
+  }
+
+  const payoutDoc = await UserRevenuePayout.create({
+    eventId: value.eventId,
+    userAuthId: value.userAuthId,
+    managerAuthId: user.authId,
+    linkedAccountId: syncedAccountDoc.razorpayLinkedAccountId,
+    sourcePaymentId: sourceOrder.razorpayPaymentId,
+    generatedRevenuePaise: value.generatedRevenuePaise,
+    totalVendorCostPaise: value.totalVendorCostPaise,
+    totalFeesPaise: value.totalFeesPaise,
+    payoutAmountPaise: value.payoutAmountPaise,
+    currency: value.currency || 'INR',
+    status: 'INITIATED',
+    notes: {
+      sourcePaymentOrderType: sourceOrder.orderType,
+      sourcePaymentOrderId: sourceOrder.razorpayOrderId,
+      sourceTransactionId: sourceOrder.transactionId,
+      payoutMode: 'RAZORPAY',
+    },
+  });
+
+  try {
+    const transferResult = await postRazorpayApi(`/v1/payments/${encodeURIComponent(sourceOrder.razorpayPaymentId)}/transfers`, {
+      transfers: [
+        {
+          account: syncedAccountDoc.razorpayLinkedAccountId,
+          amount: value.payoutAmountPaise,
+          currency: value.currency || 'INR',
+          notes: {
+            eventId: String(value.eventId),
+            userAuthId: String(value.userAuthId),
+            payoutId: payoutDoc.payoutId,
+            payoutType: 'USER_GENERATED_REVENUE',
+          },
+        },
+      ],
+    });
+
+    const firstTransfer = Array.isArray(transferResult?.items) ? transferResult.items[0] : null;
+    const transferId = String(firstTransfer?.id || '').trim();
+    if (!transferId) {
+      throw createApiError(502, 'Razorpay did not return a transfer id for user payout');
+    }
+
+    payoutDoc.status = 'SUCCESS';
+    payoutDoc.razorpayTransferId = transferId;
+    payoutDoc.paidAt = new Date();
+    payoutDoc.failureReason = null;
+    await payoutDoc.save();
+
+    try {
+      await publishEvent('USER_REVENUE_PAYOUT_SUCCESS', {
+        eventId: payoutDoc.eventId,
+        payoutId: payoutDoc.payoutId,
+        userAuthId: payoutDoc.userAuthId,
+        amount: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        managerAuthId: payoutDoc.managerAuthId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        generatedRevenuePaise: payoutDoc.generatedRevenuePaise,
+        totalVendorCostPaise: payoutDoc.totalVendorCostPaise,
+        totalFeesPaise: payoutDoc.totalFeesPaise,
+        payoutMode: 'RAZORPAY',
+        paidAt: payoutDoc.paidAt?.toISOString?.() || new Date().toISOString(),
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish USER_REVENUE_PAYOUT_SUCCESS event:', kafkaError);
+    }
+
+    return {
+      alreadyProcessed: false,
+      payoutMode: 'RAZORPAY',
+      payout: {
+        payoutId: payoutDoc.payoutId,
+        eventId: payoutDoc.eventId,
+        userAuthId: payoutDoc.userAuthId,
+        managerAuthId: payoutDoc.managerAuthId,
+        status: payoutDoc.status,
+        generatedRevenuePaise: payoutDoc.generatedRevenuePaise,
+        totalVendorCostPaise: payoutDoc.totalVendorCostPaise,
+        totalFeesPaise: payoutDoc.totalFeesPaise,
+        payoutAmountPaise: payoutDoc.payoutAmountPaise,
+        currency: payoutDoc.currency,
+        sourcePaymentId: payoutDoc.sourcePaymentId,
+        razorpayTransferId: payoutDoc.razorpayTransferId,
+        paidAt: payoutDoc.paidAt,
+      },
+    };
+  } catch (errorOrRazorpay) {
+    payoutDoc.status = 'FAILED';
+    payoutDoc.failureReason = String(errorOrRazorpay?.message || 'User payout transfer failed').slice(0, 600);
+    await payoutDoc.save();
+    throw errorOrRazorpay;
+  }
+};
+
 const refundPayment = async (payload, user) => {
   if (!user?.authId) {
     throw createApiError(401, 'User authentication information missing');
@@ -1775,4 +3348,12 @@ module.exports = {
   getAdminReports,
   exportAdminReportsCsv,
   exportAdminTransactionReceiptPdf,
+  createVendorPayoutOnboardingLink,
+  getVendorPayoutOnboardingStatus,
+  createUserPayoutOnboardingLink,
+  getUserPayoutOnboardingStatus,
+  listVendorPayoutsForEvent,
+  listVendorPayoutsForVendor,
+  releaseVendorPayout,
+  releaseUserGeneratedRevenuePayout,
 };

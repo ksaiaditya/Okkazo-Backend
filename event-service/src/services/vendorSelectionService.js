@@ -6,8 +6,16 @@ const { SERVICE_OPTIONS, VENDOR_STATUS } = require('../utils/vendorSelectionCons
 const { STATUS } = require('../utils/planningConstants');
 const vendorReservationService = require('./vendorReservationService');
 const commissionService = require('./commissionService');
+const planningQuoteService = require('./planningQuoteService');
+const { publishEvent } = require('../kafka/eventProducer');
 
-const STICKY_PLANNING_STATUSES = new Set([STATUS.CONFIRMED, STATUS.COMPLETED]);
+const STICKY_PLANNING_STATUSES = new Set([
+  STATUS.CONFIRMED,
+  STATUS.COMPLETED,
+  STATUS.VENDOR_PAYMENT_PENDING,
+  STATUS.CLOSED,
+]);
+const REMOVAL_FREEZE_HOURS = 72;
 const PRICING_UNIT_VALUES = new Set(['EVENT', 'PER_PERSON', 'PER_PLATE', 'PER_KG', 'PER_100_UNITS', 'FIXED']);
 
 const toSortedUniqueDays = (days = []) => {
@@ -125,6 +133,77 @@ const isVendorItemPriceLocked = (item) => {
   return Boolean(item?.priceLocked) && hasExplicitQuote;
 };
 
+const toPaise = (inr) => {
+  const n = Number(inr || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.round(n * 100);
+};
+
+const getPlanningStartAt = (planning) => {
+  if (!planning) return null;
+  const startCandidate = planning?.schedule?.startAt || planning?.eventDate || null;
+  if (!startCandidate) return null;
+  const startAt = new Date(startCandidate);
+  if (Number.isNaN(startAt.getTime())) return null;
+  return startAt;
+};
+
+const getFreezeInfo = (planning) => {
+  const startAt = getPlanningStartAt(planning);
+  if (!startAt) {
+    return {
+      enabled: false,
+      hoursUntilStart: null,
+    };
+  }
+
+  const diffHours = (startAt.getTime() - Date.now()) / (1000 * 60 * 60);
+  return {
+    enabled: Number.isFinite(diffHours) && diffHours <= REMOVAL_FREEZE_HOURS,
+    hoursUntilStart: Number.isFinite(diffHours) ? diffHours : null,
+  };
+};
+
+const isDirectEditBlockedByFinalization = (planning) => {
+  const status = String(planning?.status || '').trim();
+  if (STICKY_PLANNING_STATUSES.has(status)) return true;
+  return Boolean(planning?.vendorConfirmationPaid) || Boolean(planning?.fullPaymentPaid);
+};
+
+const computeSelectionTotalPaise = ({ selection, selectedServices }) => {
+  const services = Array.isArray(selectedServices) ? selectedServices.map((s) => String(s || '').trim()).filter(Boolean) : [];
+  const vendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  const byService = new Map();
+
+  for (const row of vendors) {
+    const service = String(row?.service || '').trim();
+    if (!service || !services.includes(service)) continue;
+    byService.set(service, row);
+  }
+
+  let total = 0;
+  for (const service of services) {
+    const row = byService.get(service);
+    if (!row) continue;
+
+    const quoted = Number(row?.vendorQuotedPrice || 0);
+    const isLocked = isVendorItemPriceLocked(row);
+    if (isLocked && Number.isFinite(quoted) && quoted > 0) {
+      total += toPaise(quoted);
+      continue;
+    }
+
+    const minPrice = Number(row?.servicePrice?.min || 0);
+    if (Number.isFinite(minPrice) && minPrice > 0) {
+      total += toPaise(minPrice);
+    }
+  }
+
+  return Math.max(0, total);
+};
+
+const makeChangeRequestId = () => `CR-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+
 const ensureForPlanning = async (planning) => {
   if (!planning?.eventId || !planning?.authId) {
     throw createApiError(400, 'Planning eventId and authId are required');
@@ -150,6 +229,7 @@ const ensureForPlanning = async (planning) => {
         vendorQuotedPrice: null,
         commissionPercent: null,
         commissionAmount: null,
+        priceHikeReason: null,
         priceLocked: false,
         pricingUnit: null,
         pricingQuantity: null,
@@ -219,6 +299,7 @@ const ensureForPlanning = async (planning) => {
       vendorQuotedPrice: null,
       commissionPercent: null,
       commissionAmount: null,
+      priceHikeReason: null,
       priceLocked: false,
       pricingUnit: null,
       pricingQuantity: null,
@@ -281,20 +362,62 @@ const getByEventId = async (eventId) => {
   return selection;
 };
 
-const updateSelectedServices = async ({ eventId, authId, selectedServices }) => {
+const updateSelectedServices = async ({
+  eventId,
+  authId,
+  selectedServices,
+  actorRole = 'USER',
+  actorAuthId = null,
+  emergencyOverride = false,
+  emergencyReason = '',
+}) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
   if (!authId?.trim()) throw createApiError(400, 'Auth ID is required');
 
   const services = normalizeServices(selectedServices);
+  const normalizedRole = String(actorRole || 'USER').trim().toUpperCase();
+  const isPrivilegedActor = normalizedRole === 'ADMIN' || normalizedRole === 'MANAGER';
+  const normalizedEmergencyReason = String(emergencyReason || '').trim();
 
   const planning = await Planning.findOne({ eventId: eventId.trim(), authId: authId.trim() });
   if (!planning) throw createApiError(404, 'Planning not found');
 
   const selection = await ensureForPlanning(planning);
   const planningDays = vendorReservationService.planningToReservationDays(planning);
+  const previousServices = Array.isArray(selection.selectedServices)
+    ? selection.selectedServices.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
   const previousVendors = Array.isArray(selection.vendors)
     ? selection.vendors.map((v) => (v?.toObject ? v.toObject() : v))
     : [];
+
+  const previousServiceSet = new Set(previousServices);
+  const nextServiceSet = new Set(services.map((s) => String(s || '').trim()).filter(Boolean));
+  const removedServices = previousServices.filter((s) => !nextServiceSet.has(s));
+  const addedServices = services.filter((s) => !previousServiceSet.has(s));
+
+  if (addedServices.length === 0 && removedServices.length === 0) {
+    return selection.toObject();
+  }
+
+  const freezeInfo = getFreezeInfo(planning);
+  if (removedServices.length > 0 && freezeInfo.enabled) {
+    if (!isPrivilegedActor || !emergencyOverride || !normalizedEmergencyReason) {
+      throw createApiError(
+        409,
+        `Service removals are frozen within ${REMOVAL_FREEZE_HOURS} hours of event start. Ask manager/admin for emergency override.`
+      );
+    }
+  }
+
+  if (isDirectEditBlockedByFinalization(planning)) {
+    if (!isPrivilegedActor || !emergencyOverride || !normalizedEmergencyReason) {
+      throw createApiError(
+        409,
+        'Direct service edits are locked after vendor confirmation. Submit a change request for manager approval.'
+      );
+    }
+  }
 
   selection.selectedServices = services;
 
@@ -313,6 +436,7 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
       vendorQuotedPrice: null,
       commissionPercent: null,
       commissionAmount: null,
+      priceHikeReason: null,
       priceLocked: false,
       pricingUnit: null,
       pricingQuantity: null,
@@ -328,6 +452,58 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
     { _id: planning._id },
     { $set: { selectedServices: services } }
   );
+
+  const acceptedRemovedVendors = previousVendors.filter((item) => {
+    const service = String(item?.service || '').trim();
+    if (!service || !removedServices.includes(service)) return false;
+    return String(item?.status || '').trim().toUpperCase() === VENDOR_STATUS.ACCEPTED;
+  });
+
+  const currentPlanningStatus = String(planning.status || '').trim();
+  const vendorsAcceptedAfterSelection = Boolean(selection?.vendorsAccepted);
+  let planningStatusReset = false;
+  let planningStatusAutoApproved = false;
+  let nextPlanningStatus = currentPlanningStatus || null;
+
+  if (!planning.vendorConfirmationPaid) {
+    if (vendorsAcceptedAfterSelection && currentPlanningStatus !== STATUS.APPROVED) {
+      await Planning.updateOne(
+        { _id: planning._id },
+        {
+          $set: {
+            status: STATUS.APPROVED,
+          },
+        }
+      );
+      planningStatusAutoApproved = true;
+      nextPlanningStatus = STATUS.APPROVED;
+
+      try {
+        await planningQuoteService.lockQuoteAtApproved({
+          eventId: eventId.trim(),
+          lockedByAuthId: String(actorAuthId || authId || '').trim() || null,
+        });
+      } catch (error) {
+        logger.warn('Failed to lock quote after auto-approving planning on service update', {
+          eventId: eventId.trim(),
+          message: error?.message || String(error),
+        });
+      }
+    } else if (!vendorsAcceptedAfterSelection && currentPlanningStatus === STATUS.APPROVED) {
+      await Planning.updateOne(
+        { _id: planning._id },
+        {
+          $set: {
+            status: STATUS.PENDING_APPROVAL,
+            quoteLockedAt: null,
+            quoteLockedVersion: null,
+          },
+        }
+      );
+      planningStatusReset = true;
+      nextPlanningStatus = STATUS.PENDING_APPROVAL;
+    }
+  }
 
   // Release reservations for services that were removed from selection.
   if (planningDays.length > 0) {
@@ -362,12 +538,72 @@ const updateSelectedServices = async ({ eventId, authId, selectedServices }) => 
     );
   }
 
-  return selection.toObject();
+  try {
+    const affectedVendorAuthIds = Array.from(
+      new Set(
+        previousVendors
+          .filter((row) => removedServices.includes(String(row?.service || '').trim()))
+          .map((row) => String(row?.vendorAuthId || '').trim())
+          .filter(Boolean)
+      )
+    );
+
+    await publishEvent(
+      'PLANNING_VENDOR_SELECTION_CHANGED',
+      {
+        eventId: eventId.trim(),
+        planningAuthId: authId.trim(),
+        actorAuthId: String(actorAuthId || authId || '').trim() || null,
+        actorRole: normalizedRole,
+        addedServices,
+        removedServices,
+        acceptedRemovedServices: acceptedRemovedVendors.map((row) => ({
+          service: String(row?.service || '').trim(),
+          vendorAuthId: String(row?.vendorAuthId || '').trim() || null,
+          serviceId: row?.serviceId ? String(row.serviceId).trim() : null,
+        })),
+        affectedVendorAuthIds,
+        planningStatusReset,
+        planningStatusAutoApproved,
+        nextPlanningStatus,
+      },
+      `${eventId.trim()}:${Date.now()}:services`
+    );
+  } catch (error) {
+    logger.warn('Failed to publish PLANNING_VENDOR_SELECTION_CHANGED event', {
+      eventId: eventId.trim(),
+      message: error?.message || String(error),
+    });
+  }
+
+  const result = selection.toObject();
+  return {
+    ...result,
+    policy: {
+      addedServices,
+      removedServices,
+      planningStatusReset,
+      planningStatusAutoApproved,
+      nextPlanningStatus,
+    },
+  };
 };
 
-const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
+const upsertVendor = async ({
+  eventId,
+  authId,
+  vendorUpdate,
+  actorRole = 'USER',
+  actorAuthId = null,
+  emergencyOverride = false,
+  emergencyReason = '',
+}) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
   if (!authId?.trim()) throw createApiError(400, 'Auth ID is required');
+
+  const normalizedRole = String(actorRole || 'USER').trim().toUpperCase();
+  const isPrivilegedActor = normalizedRole === 'ADMIN' || normalizedRole === 'MANAGER';
+  const normalizedEmergencyReason = String(emergencyReason || '').trim();
 
   const planning = await Planning.findOne({ eventId: eventId.trim(), authId: authId.trim() });
   if (!planning) throw createApiError(404, 'Planning not found');
@@ -429,6 +665,7 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     vendorQuotedPrice: null,
     commissionPercent: null,
     commissionAmount: null,
+    priceHikeReason: null,
     priceLocked: false,
     pricingUnit: sanitizePricingUnit(vendorUpdate?.pricingUnit),
     pricingQuantity: sanitizePricingQuantity(vendorUpdate?.pricingQuantity),
@@ -448,6 +685,7 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     next.vendorQuotedPrice = null;
     next.commissionPercent = null;
     next.commissionAmount = null;
+    next.priceHikeReason = null;
     next.priceLocked = false;
   }
 
@@ -473,6 +711,31 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     )) ||
     (next.vendorAuthId == null && currentVendorAuthId != null);
   const deselectRequested = next.vendorAuthId == null;
+
+  const freezeInfo = getFreezeInfo(planning);
+  const isRemovalAction = Boolean(currentVendorAuthId) && (
+    deselectRequested ||
+    (next.vendorAuthId && next.vendorAuthId !== currentVendorAuthId) ||
+    ((next.serviceId || null) !== (currentServiceId || null))
+  );
+
+  if (isRemovalAction && freezeInfo.enabled) {
+    if (!isPrivilegedActor || !emergencyOverride || !normalizedEmergencyReason) {
+      throw createApiError(
+        409,
+        `Vendor removals are frozen within ${REMOVAL_FREEZE_HOURS} hours of event start. Ask manager/admin for emergency override.`
+      );
+    }
+  }
+
+  if (isDirectEditBlockedByFinalization(planning) && reservationIdentityChanged) {
+    if (!isPrivilegedActor || !emergencyOverride || !normalizedEmergencyReason) {
+      throw createApiError(
+        409,
+        'Direct vendor changes are locked after vendor confirmation. Submit a change request for manager approval.'
+      );
+    }
+  }
 
   // Claim reservation first (so we don't drop an existing valid selection on conflict)
   // We intentionally claim even when vendor/service identity is unchanged to ensure
@@ -591,7 +854,399 @@ const upsertVendor = async ({ eventId, authId, vendorUpdate }) => {
     );
   }
 
-  return selection.toObject();
+  let planningStatusReset = false;
+  if (!planning.vendorConfirmationPaid && String(planning.status || '').trim() === STATUS.APPROVED && reservationIdentityChanged) {
+    await Planning.updateOne(
+      { _id: planning._id },
+      {
+        $set: {
+          status: STATUS.PENDING_APPROVAL,
+          quoteLockedAt: null,
+          quoteLockedVersion: null,
+        },
+      }
+    );
+    planningStatusReset = true;
+  }
+
+  try {
+    await publishEvent(
+      'PLANNING_VENDOR_ASSIGNMENT_CHANGED',
+      {
+        eventId: eventId.trim(),
+        planningAuthId: authId.trim(),
+        actorAuthId: String(actorAuthId || authId || '').trim() || null,
+        actorRole: normalizedRole,
+        service,
+        previous: {
+          vendorAuthId: currentVendorAuthId,
+          serviceId: currentServiceId,
+        },
+        next: {
+          vendorAuthId: next.vendorAuthId || null,
+          serviceId: next.serviceId || null,
+        },
+        planningStatusReset,
+      },
+      `${eventId.trim()}:${service}:${Date.now()}:vendor`
+    );
+  } catch (error) {
+    logger.warn('Failed to publish PLANNING_VENDOR_ASSIGNMENT_CHANGED event', {
+      eventId: eventId.trim(),
+      service,
+      message: error?.message || String(error),
+    });
+  }
+
+  const result = selection.toObject();
+  return {
+    ...result,
+    policy: {
+      planningStatusReset,
+      nextPlanningStatus: planningStatusReset ? STATUS.PENDING_APPROVAL : String(planning.status || '').trim() || null,
+    },
+  };
+};
+
+const createServiceChangeRequest = async ({
+  eventId,
+  authId,
+  selectedServices,
+  reason = '',
+  actorRole = 'USER',
+  actorAuthId = null,
+  emergencyOverride = false,
+  emergencyReason = '',
+}) => {
+  if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
+  if (!authId?.trim()) throw createApiError(400, 'Auth ID is required');
+
+  const normalizedRole = String(actorRole || 'USER').trim().toUpperCase();
+  const normalizedReason = String(reason || '').trim();
+  const normalizedEmergencyReason = String(emergencyReason || '').trim();
+  const isPrivilegedActor = normalizedRole === 'ADMIN' || normalizedRole === 'MANAGER';
+
+  const services = normalizeServices(selectedServices);
+  const planning = await Planning.findOne({ eventId: eventId.trim(), authId: authId.trim() });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const selection = await ensureForPlanning(planning);
+  const currentServices = Array.isArray(selection.selectedServices)
+    ? selection.selectedServices.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+
+  const currentSet = new Set(currentServices);
+  const nextSet = new Set(services.map((s) => String(s || '').trim()).filter(Boolean));
+  const addedServices = services.filter((s) => !currentSet.has(s));
+  const removedServices = currentServices.filter((s) => !nextSet.has(s));
+
+  if (addedServices.length === 0 && removedServices.length === 0) {
+    throw createApiError(400, 'No changes detected for service change request');
+  }
+
+  const freezeInfo = getFreezeInfo(planning);
+  if (removedServices.length > 0 && freezeInfo.enabled) {
+    if (!isPrivilegedActor || !emergencyOverride || !normalizedEmergencyReason) {
+      throw createApiError(
+        409,
+        `Service removals are frozen within ${REMOVAL_FREEZE_HOURS} hours of event start. Ask manager/admin for emergency override.`
+      );
+    }
+  }
+
+  const rows = Array.isArray(selection.vendors) ? selection.vendors : [];
+  const affectedAcceptedServices = rows
+    .filter((row) => removedServices.includes(String(row?.service || '').trim()))
+    .filter((row) => String(row?.status || '').trim().toUpperCase() === VENDOR_STATUS.ACCEPTED)
+    .map((row) => ({
+      service: String(row?.service || '').trim(),
+      previousVendorAuthId: String(row?.vendorAuthId || '').trim() || null,
+      previousServiceId: row?.serviceId ? String(row.serviceId).trim() : null,
+      requiresVendorConsent: true,
+    }));
+
+  const currentGrandTotalPaise = computeSelectionTotalPaise({ selection, selectedServices: currentServices });
+  const proposedGrandTotalPaise = computeSelectionTotalPaise({ selection, selectedServices: services });
+  const deltaPaise = proposedGrandTotalPaise - currentGrandTotalPaise;
+
+  const request = {
+    requestId: makeChangeRequestId(),
+    type: 'SERVICE_CHANGE',
+    status: 'PENDING_MANAGER_APPROVAL',
+    requestedByAuthId: String(actorAuthId || authId || '').trim() || authId.trim(),
+    requestedByRole: normalizedRole,
+    reason: normalizedReason || null,
+    emergencyOverride: Boolean(emergencyOverride),
+    emergencyReason: normalizedEmergencyReason || null,
+    serviceDelta: {
+      added: addedServices,
+      removed: removedServices,
+    },
+    proposedSelectedServices: services,
+    affectedAcceptedServices,
+    vendorConsents: Array.from(
+      new Set(
+        affectedAcceptedServices
+          .map((entry) => String(entry?.previousVendorAuthId || '').trim())
+          .filter(Boolean)
+      )
+    ).map((vendorAuthId) => ({
+      vendorAuthId,
+      status: 'PENDING',
+      note: null,
+      at: null,
+    })),
+    priceDelta: {
+      currentGrandTotalPaise,
+      proposedGrandTotalPaise,
+      deltaPaise,
+      // Placeholder until policy matrix is configured.
+      suggestedAdjustmentFeePaise: 0,
+    },
+    vendorConsent: {
+      status: affectedAcceptedServices.length > 0 ? 'PENDING' : 'NOT_REQUIRED',
+      note: null,
+      at: null,
+    },
+    createdAt: new Date(),
+  };
+
+  await Planning.updateOne(
+    { _id: planning._id },
+    {
+      $push: {
+        changeRequests: request,
+      },
+    }
+  );
+
+  try {
+    await publishEvent(
+      'PLANNING_CHANGE_REQUEST_CREATED',
+      {
+        eventId: eventId.trim(),
+        planningAuthId: authId.trim(),
+        requestId: request.requestId,
+        requestType: request.type,
+        requestedByAuthId: request.requestedByAuthId,
+        requestedByRole: request.requestedByRole,
+        addedServices,
+        removedServices,
+        affectedAcceptedServices,
+        priceDelta: request.priceDelta,
+      },
+      `${eventId.trim()}:${request.requestId}`
+    );
+  } catch (error) {
+    logger.warn('Failed to publish PLANNING_CHANGE_REQUEST_CREATED event', {
+      eventId: eventId.trim(),
+      requestId: request.requestId,
+      message: error?.message || String(error),
+    });
+  }
+
+  return {
+    request,
+    preview: {
+      addedServices,
+      removedServices,
+      affectedAcceptedServices,
+      priceDelta: request.priceDelta,
+      requiresVendorConsent: affectedAcceptedServices.length > 0,
+      managerApprovalRequired: true,
+    },
+  };
+};
+
+const decideServiceChangeRequestByManager = async ({
+  eventId,
+  authId,
+  requestId,
+  managerAuthId,
+  approve,
+  note = '',
+}) => {
+  const eid = normalizeEventId(eventId);
+  const ownerAuthId = String(authId || '').trim();
+  if (!ownerAuthId) throw createApiError(400, 'authId is required');
+
+  const rid = String(requestId || '').trim();
+  if (!rid) throw createApiError(400, 'requestId is required');
+
+  const actorAuthId = String(managerAuthId || '').trim();
+  if (!actorAuthId) throw createApiError(400, 'managerAuthId is required');
+
+  const managerNote = String(note || '').trim() || null;
+
+  const planning = await Planning.findOne({ eventId: eid, authId: ownerAuthId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const idx = Array.isArray(planning.changeRequests)
+    ? planning.changeRequests.findIndex((item) => String(item?.requestId || '').trim() === rid)
+    : -1;
+  if (idx < 0) throw createApiError(404, 'Change request not found');
+
+  const request = planning.changeRequests[idx];
+  if (String(request?.type || '').trim() !== 'SERVICE_CHANGE') {
+    throw createApiError(409, 'Unsupported change request type');
+  }
+
+  const currentStatus = String(request?.status || '').trim();
+  if (currentStatus !== 'PENDING_MANAGER_APPROVAL') {
+    throw createApiError(409, `Change request is already ${currentStatus}`);
+  }
+
+  request.managerDecision = {
+    byAuthId: actorAuthId,
+    at: new Date(),
+    note: managerNote,
+  };
+
+  if (!approve) {
+    request.status = 'REJECTED';
+    await planning.save({ validateBeforeSave: false });
+    return { request: request.toObject ? request.toObject() : request, applied: false };
+  }
+
+  const vendorConsents = Array.isArray(request.vendorConsents) ? request.vendorConsents : [];
+  const pendingConsents = vendorConsents.filter((consent) => String(consent?.status || '').trim() === 'PENDING');
+
+  if (pendingConsents.length > 0) {
+    request.status = 'PENDING_VENDOR_CONSENT';
+    request.vendorConsent = {
+      ...(request.vendorConsent || {}),
+      status: 'PENDING',
+    };
+    await planning.save({ validateBeforeSave: false });
+    return { request: request.toObject ? request.toObject() : request, applied: false };
+  }
+
+  const targetServices = Array.isArray(request?.proposedSelectedServices)
+    ? request.proposedSelectedServices.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+  if (targetServices.length === 0) {
+    throw createApiError(409, 'Change request does not include target services');
+  }
+
+  await updateSelectedServices({
+    eventId: eid,
+    authId: ownerAuthId,
+    selectedServices: targetServices,
+    actorRole: 'MANAGER',
+    actorAuthId,
+    emergencyOverride: true,
+    emergencyReason: String(request?.emergencyReason || request?.reason || 'Approved managed change request').trim() || 'Approved managed change request',
+  });
+
+  request.status = 'APPROVED';
+  request.vendorConsent = {
+    ...(request.vendorConsent || {}),
+    status: vendorConsents.length > 0 ? 'APPROVED' : 'NOT_REQUIRED',
+    at: new Date(),
+  };
+
+  await planning.save({ validateBeforeSave: false });
+  return { request: request.toObject ? request.toObject() : request, applied: true };
+};
+
+const submitVendorConsentForServiceChangeRequest = async ({
+  eventId,
+  authId,
+  requestId,
+  vendorAuthId,
+  approve,
+  note = '',
+}) => {
+  const eid = normalizeEventId(eventId);
+  const ownerAuthId = String(authId || '').trim();
+  if (!ownerAuthId) throw createApiError(400, 'authId is required');
+
+  const rid = String(requestId || '').trim();
+  if (!rid) throw createApiError(400, 'requestId is required');
+
+  const actorVendorAuthId = normalizeVendorAuthId(vendorAuthId);
+  const vendorNote = String(note || '').trim() || null;
+
+  const planning = await Planning.findOne({ eventId: eid, authId: ownerAuthId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const idx = Array.isArray(planning.changeRequests)
+    ? planning.changeRequests.findIndex((item) => String(item?.requestId || '').trim() === rid)
+    : -1;
+  if (idx < 0) throw createApiError(404, 'Change request not found');
+
+  const request = planning.changeRequests[idx];
+  const currentStatus = String(request?.status || '').trim();
+  if (currentStatus !== 'PENDING_VENDOR_CONSENT') {
+    throw createApiError(409, `Change request is ${currentStatus}, vendor consent is not allowed now`);
+  }
+
+  const vendorConsents = Array.isArray(request.vendorConsents) ? request.vendorConsents : [];
+  const consentEntry = vendorConsents.find((entry) => String(entry?.vendorAuthId || '').trim() === actorVendorAuthId);
+  if (!consentEntry) {
+    throw createApiError(403, 'You are not an affected vendor for this change request');
+  }
+
+  const consentStatus = String(consentEntry?.status || '').trim();
+  if (consentStatus !== 'PENDING') {
+    throw createApiError(409, `You already responded as ${consentStatus}`);
+  }
+
+  consentEntry.status = approve ? 'APPROVED' : 'REJECTED';
+  consentEntry.note = vendorNote;
+  consentEntry.at = new Date();
+
+  if (!approve) {
+    request.status = 'REJECTED';
+    request.vendorConsent = {
+      ...(request.vendorConsent || {}),
+      status: 'REJECTED',
+      note: vendorNote,
+      at: new Date(),
+    };
+
+    await planning.save({ validateBeforeSave: false });
+    return { request: request.toObject ? request.toObject() : request, applied: false };
+  }
+
+  const allApproved = vendorConsents.every((entry) => String(entry?.status || '').trim() === 'APPROVED');
+  if (!allApproved) {
+    request.vendorConsent = {
+      ...(request.vendorConsent || {}),
+      status: 'PENDING',
+    };
+
+    await planning.save({ validateBeforeSave: false });
+    return { request: request.toObject ? request.toObject() : request, applied: false };
+  }
+
+  const targetServices = Array.isArray(request?.proposedSelectedServices)
+    ? request.proposedSelectedServices.map((s) => String(s || '').trim()).filter(Boolean)
+    : [];
+  if (targetServices.length === 0) {
+    throw createApiError(409, 'Change request does not include target services');
+  }
+
+  const managerAuthId = String(request?.managerDecision?.byAuthId || '').trim() || ownerAuthId;
+  await updateSelectedServices({
+    eventId: eid,
+    authId: ownerAuthId,
+    selectedServices: targetServices,
+    actorRole: 'MANAGER',
+    actorAuthId: managerAuthId,
+    emergencyOverride: true,
+    emergencyReason: String(request?.emergencyReason || request?.reason || 'Approved vendor-consent change request').trim() || 'Approved vendor-consent change request',
+  });
+
+  request.status = 'APPROVED';
+  request.vendorConsent = {
+    ...(request.vendorConsent || {}),
+    status: 'APPROVED',
+    at: new Date(),
+  };
+
+  await planning.save({ validateBeforeSave: false });
+  return { request: request.toObject ? request.toObject() : request, applied: true };
 };
 
 const releaseReservationsForPlanning = async ({ eventId, authId, service = null, force = false }) => {
@@ -792,7 +1447,7 @@ const getSelectionForVendorEvent = async ({ eventId, vendorAuthId }) => {
   };
 };
 
-const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice }) => {
+const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice, priceHikeReason }) => {
   const eid = normalizeEventId(eventId);
   const vendor = normalizeVendorAuthId(vendorAuthId);
   const canonicalService = canonicalizeService(service);
@@ -825,6 +1480,11 @@ const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice 
   const cfg = await commissionService.getCommissionConfig();
   const percentRaw = Number(cfg?.rates?.[canonicalService] ?? 0);
   const configuredPercent = Number.isFinite(percentRaw) && percentRaw > 0 ? percentRaw : 0;
+  const hikeRateRaw = Number(cfg?.vendorHikeRate);
+  const vendorHikeRate = Number.isFinite(hikeRateRaw) && hikeRateRaw >= 1
+    ? hikeRateRaw
+    : commissionService.DEFAULT_VENDOR_HIKE_RATE;
+  const normalizedPriceHikeReason = String(priceHikeReason || '').trim();
 
   let commissionPercent = 0;
   let commissionAmount = 0;
@@ -832,12 +1492,16 @@ const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice 
 
   const hasValidRange = minRange > 0 && maxRange > minRange;
   if (hasValidRange) {
-    const quoteCap = toMoney(Math.min(maxRange, minRange * 1.25));
+    const quoteCap = toMoney(Math.min(maxRange, minRange * vendorHikeRate));
     if (quoted > quoteCap) {
       throw createApiError(
         400,
-        `Quoted price cannot exceed ${quoteCap} for ${canonicalService}. Max allowed is min*1.25 based on booking range.`
+        `Quoted price cannot exceed ${quoteCap} for ${canonicalService}. Max allowed is min*${vendorHikeRate} based on booking range.`
       );
+    }
+
+    if (quoted > minRange && !normalizedPriceHikeReason) {
+      throw createApiError(400, 'Please provide reason for price increase above minimum range');
     }
 
     if (configuredPercent > 0) {
@@ -847,19 +1511,22 @@ const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice 
     } else {
       // Fallback behavior when no admin commission is configured.
       const commissionSlice = toMoney(Math.max(0, maxRange - quoteCap));
-      commissionAmount = commissionSlice;
+      commissionAmount = toMoney(Math.min(quoted, commissionSlice));
       commissionPercent = quoted > 0 ? toMoney((commissionAmount / quoted) * 100) : 0;
     }
-    lockedPrice = toMoney(quoted + commissionAmount);
+    // Commission is included in vendor-entered quote, not added on top.
+    lockedPrice = quoted;
   } else {
     commissionPercent = configuredPercent;
     commissionAmount = toMoney((quoted * commissionPercent) / 100);
-    lockedPrice = toMoney(quoted + commissionAmount);
+    // Commission is included in vendor-entered quote, not added on top.
+    lockedPrice = quoted;
   }
 
   item.vendorQuotedPrice = quoted;
   item.commissionPercent = commissionPercent;
   item.commissionAmount = commissionAmount;
+  item.priceHikeReason = hasValidRange && quoted > minRange ? normalizedPriceHikeReason : null;
   item.priceLocked = true;
 
   selection.vendors = vendors;
@@ -872,6 +1539,8 @@ const lockPriceForVendor = async ({ eventId, vendorAuthId, service, quotedPrice 
     commissionPercent,
     commissionAmount,
     lockedPrice,
+    priceHikeReason: item.priceHikeReason || null,
+    vendorHikeRate,
   };
 };
 
@@ -978,4 +1647,7 @@ module.exports = {
   getSelectionForVendorEvent,
   lockPriceForVendor,
   respondForVendor,
+  createServiceChangeRequest,
+  decideServiceChangeRequestByManager,
+  submitVendorConsentForServiceChangeRequest,
 };

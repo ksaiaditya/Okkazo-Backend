@@ -1,6 +1,7 @@
 const planningService = require('../services/planningService');
 const planningQuoteService = require('../services/planningQuoteService');
 const promoteConfigService = require('../services/promoteConfigService');
+const VendorSelection = require('../models/VendorSelection');
 const { resolveUserServiceIdFromAuthId, fetchUserById } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
@@ -21,6 +22,48 @@ const vendorServiceUrl = process.env.VENDOR_SERVICE_URL || defaultVendorServiceU
 const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
 const HIGH_DEMAND_START_DAYS = 6;
 const HIGH_DEMAND_END_DAYS = 20;
+const PLANNING_LIFECYCLE_STATUSES = new Set(['CONFIRMED', 'LIVE', 'COMPLETED', 'COMPLETE', 'CLOSED']);
+
+const listAcceptedVendorAuthIdsForEvent = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  const selection = await VendorSelection.findOne({ eventId: normalizedEventId })
+    .select('vendors.vendorAuthId vendors.status')
+    .lean();
+
+  const vendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  return Array.from(
+    new Set(
+      vendors
+        .filter((row) => String(row?.status || '').trim().toUpperCase() === 'ACCEPTED')
+        .map((row) => String(row?.vendorAuthId || '').trim())
+        .filter(Boolean)
+    )
+  );
+};
+
+const publishPlanningLifecycleEventIfNeeded = async ({ planning, updatedBy = null }) => {
+  const status = String(planning?.status || '').trim().toUpperCase();
+  if (!PLANNING_LIFECYCLE_STATUSES.has(status)) return;
+
+  let vendorAuthIds = [];
+  if (status === 'CONFIRMED' || status === 'CLOSED') {
+    vendorAuthIds = await listAcceptedVendorAuthIdsForEvent(planning?.eventId);
+  }
+
+  await publishEvent('EVENT_LIFECYCLE_STATUS_UPDATED', {
+    eventId: String(planning?.eventId || '').trim() || null,
+    authId: String(planning?.authId || '').trim() || null,
+    status,
+    eventType: 'planning',
+    assignedManagerId: String(planning?.assignedManagerId || '').trim() || null,
+    vendorAuthIds,
+    eventTitle: String(planning?.eventTitle || '').trim() || null,
+    updatedBy: updatedBy ? String(updatedBy).trim() : null,
+    occurredAt: new Date().toISOString(),
+  });
+};
 
 const toNumber = (value, fallback = null) => {
   if (value == null) return fallback;
@@ -115,7 +158,7 @@ const getDemandTierForDay = (day) => {
 };
 
 const ensureAccessToPlanning = async ({ eventId, user }) => {
-  const planning = await planningService.getPlanningByEventId(eventId);
+  const planning = await planningService.getPlanningByEventId(eventId, user?.role || null);
 
   if (
     user?.role !== 'ADMIN' &&
@@ -198,6 +241,11 @@ const unassignPlanningManager = async (req, res) => {
         assignedManagerId: planning.assignedManagerId,
         updatedBy: req.user?.authId || null,
       });
+
+      await publishPlanningLifecycleEventIfNeeded({
+        planning,
+        updatedBy: req.user?.authId || null,
+      });
     } catch (kafkaError) {
       logger.error('Failed to publish PLANNING_STATUS_UPDATED event:', kafkaError);
     }
@@ -228,6 +276,7 @@ const fetchAllVendorsBasedOnService = async ({
   day,
   from,
   to,
+  preferAvailabilityEndpoint = true,
 }) => {
   const params = {
     serviceCategory,
@@ -252,7 +301,7 @@ const fetchAllVendorsBasedOnService = async ({
   if (from != null && String(from).trim()) params.from = String(from).trim();
   if (to != null && String(to).trim()) params.to = String(to).trim();
 
-  const upstreamPath = hasAvailabilityRange
+  const upstreamPath = (preferAvailabilityEndpoint && hasAvailabilityRange)
     ? '/api/vendor/services/available'
     : '/api/vendor/services/search';
 
@@ -368,7 +417,7 @@ const getMyPlannings = async (req, res) => {
     if (isNaN(limit) || limit < 1) limit = 10;
     if (limit > 100) limit = 100;
 
-    const result = await planningService.getPlanningsByAuthId(req.user.authId, page, limit);
+    const result = await planningService.getPlanningsByAuthId(req.user.authId, page, limit, req.user?.role || null);
 
     res.status(200).json({
       success: true,
@@ -399,7 +448,7 @@ const getPlanningByEventId = async (req, res) => {
       });
     }
 
-    const planning = await planningService.getPlanningByEventId(eventId);
+    const planning = await planningService.getPlanningByEventId(eventId, req.user?.role || null);
 
     // Regular users can only access their own plannings
     if (
@@ -443,7 +492,7 @@ const getPlanningQuoteLatest = async (req, res) => {
       });
     }
 
-    const planning = await planningService.getPlanningByEventId(eventId);
+    const planning = await planningService.getPlanningByEventId(eventId, req.user?.role || null);
     if (
       req.user.role !== 'ADMIN' &&
       req.user.role !== 'MANAGER' &&
@@ -470,6 +519,71 @@ const getPlanningQuoteLatest = async (req, res) => {
 };
 
 /**
+ * Manually send the latest locked quotation email for a planning event.
+ * POST /planning/:eventId/quote/send-email
+ */
+const sendPlanningQuoteEmail = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const planning = await planningService.getPlanningByEventId(eventId, req.user?.role || null);
+    const ownerAuthId = String(planning?.authId || '').trim();
+
+    if (!ownerAuthId) {
+      return res.status(409).json({
+        success: false,
+        message: 'Planning owner not found',
+      });
+    }
+
+    const latestQuote = await planningQuoteService.getLatestSnapshotForEvent({ eventId });
+    const quoteVersion = Number(latestQuote?.version || 0);
+
+    if (!Number.isFinite(quoteVersion) || quoteVersion <= 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'Latest quote snapshot is not available',
+      });
+    }
+
+    await publishEvent(
+      'PLANNING_QUOTE_LOCKED',
+      {
+        eventId: String(eventId).trim(),
+        authId: ownerAuthId,
+        version: quoteVersion,
+        forceSend: true,
+        emailAudience: 'USER_ONLY',
+        manualTriggeredBy: req.user?.authId || null,
+      },
+      `${String(eventId).trim()}:${quoteVersion}:manual:${Date.now()}`
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: 'Quotation email queued successfully',
+      data: {
+        eventId: String(eventId).trim(),
+        version: quoteVersion,
+      },
+    });
+  } catch (error) {
+    logger.error('Error in sendPlanningQuoteEmail:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to send quotation email',
+    });
+  }
+};
+
+/**
  * Get all plannings with pagination and filters (Admin/Manager)
  * GET /planning
  */
@@ -490,7 +604,7 @@ const getAllPlannings = async (req, res) => {
     if (isUrgent !== undefined) filters.isUrgent = isUrgent;
     if (search && search.trim() !== '') filters.search = search.trim();
 
-    const result = await planningService.getAllPlannings(filters, page, limit);
+    const result = await planningService.getAllPlannings(filters, page, limit, req.user?.role || null);
 
     res.status(200).json({
       success: true,
@@ -542,6 +656,11 @@ const updatePlanningStatus = async (req, res) => {
         assignedManagerId: planning.assignedManagerId,
         updatedBy: req.user.authId,
       });
+
+      await publishPlanningLifecycleEventIfNeeded({
+        planning,
+        updatedBy: req.user?.authId || null,
+      });
     } catch (kafkaError) {
       logger.error('Failed to publish PLANNING_STATUS_UPDATED event:', kafkaError);
     }
@@ -556,6 +675,95 @@ const updatePlanningStatus = async (req, res) => {
     res.status(error.statusCode || 500).json({
       success: false,
       message: error.message,
+    });
+  }
+};
+
+/**
+ * Mark planning event as completed (Owner or assigned Manager)
+ * PATCH /planning/:eventId/mark-complete
+ */
+const markPlanningAsComplete = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const planning = await planningService.markPlanningAsComplete({
+      eventId,
+      actorAuthId: req.user?.authId,
+      actorUserId: req.user?.userId,
+      actorRole: req.user?.role,
+    });
+
+    try {
+      await publishEvent('PLANNING_STATUS_UPDATED', {
+        eventId: planning.eventId,
+        authId: planning.authId,
+        status: planning.status,
+        assignedManagerId: planning.assignedManagerId,
+        updatedBy: req.user?.authId || null,
+      });
+
+      await publishPlanningLifecycleEventIfNeeded({
+        planning,
+        updatedBy: req.user?.authId || null,
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish PLANNING_STATUS_UPDATED after mark complete:', kafkaError);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Planning marked as complete',
+      data: planning,
+    });
+  } catch (error) {
+    logger.error('Error in markPlanningAsComplete:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+};
+
+/**
+ * Submit post-completion feedback (Owner)
+ * PATCH /planning/:eventId/feedback
+ */
+const submitPlanningFeedback = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!eventId || eventId.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Event ID is required',
+      });
+    }
+
+    const updated = await planningService.submitPlanningFeedback({
+      eventId,
+      authId: req.user?.authId,
+      platformFeedback: req.body?.platformFeedback,
+      vendorFeedback: req.body?.vendorFeedback,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Feedback submitted successfully',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in submitPlanningFeedback:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to submit feedback',
     });
   }
 };
@@ -598,7 +806,7 @@ const deletePlanning = async (req, res) => {
     }
 
     // Fetch planning first (for ownership check + banner cleanup)
-    const planning = await planningService.getPlanningByEventId(eventId);
+    const planning = await planningService.getPlanningByEventId(eventId, req.user?.role || null);
 
     // Check ownership (unless admin)
     if (req.user.role !== 'ADMIN' && planning.authId !== req.user.authId) {
@@ -852,6 +1060,67 @@ const removePlanningCoreStaff = async (req, res) => {
 };
 
 /**
+ * Release generated revenue payout to user for public planning event (Manager/Admin)
+ * PATCH /planning/:eventId/generated-revenue-payout
+ */
+const releasePlanningGeneratedRevenuePayout = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await planningService.releasePlanningGeneratedRevenuePayout({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+      mode: req.body?.mode || 'DEMO',
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: updated?.generatedRevenuePayoutSummary?.alreadyProcessed
+        ? 'Generated revenue payout already sent to user'
+        : 'Generated revenue payout sent to user',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in releasePlanningGeneratedRevenuePayout:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to release generated revenue payout',
+    });
+  }
+};
+
+/**
+ * Trigger EMAIL BLAST promotion action (Manager/Admin)
+ * POST /planning/:eventId/promotion-actions/email-blast
+ */
+const triggerPlanningEmailBlastPromotionAction = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const result = await planningService.triggerPlanningEmailBlastPromotionAction({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Email blast request submitted successfully',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in triggerPlanningEmailBlastPromotionAction:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to trigger email blast',
+    });
+  }
+};
+
+/**
  * Confirm a planning selection (Owner)
  * POST /planning/:eventId/confirm
  */
@@ -912,7 +1181,12 @@ const getVendorsForPlanning = async (req, res) => {
       day,
       from,
       to,
+      includeUnavailable,
     } = req.query;
+
+    const includeUnavailableVendors = !['false', '0', 'no'].includes(
+      String(includeUnavailable == null ? 'true' : includeUnavailable).trim().toLowerCase()
+    );
 
     if (!eventId || !eventId.trim()) {
       return res.status(400).json({ success: false, message: 'Event ID is required' });
@@ -980,6 +1254,7 @@ const getVendorsForPlanning = async (req, res) => {
       day: reservationDays.length === 1 ? reservationDays[0] : null,
       from: reservationDays.length > 1 ? reservationDays[0] : null,
       to: reservationDays.length > 1 ? reservationDays[reservationDays.length - 1] : null,
+      preferAvailabilityEndpoint: !includeUnavailableVendors,
     });
 
     const minP = toNumber(priceMin, 0);
@@ -1108,6 +1383,9 @@ const getVendorsForPlanning = async (req, res) => {
           serviceCategory: normalizedServiceCategory,
           categoryId: services?.[0]?.categoryId || null,
           rating,
+          images: app?.images || null,
+          banner: app?.images?.banner?.fileUrl || null,
+          profileImage: app?.images?.profile?.fileUrl || null,
           location: {
             name: app?.location || null,
             latitude: vLat,
@@ -1147,7 +1425,7 @@ const getVendorsForPlanning = async (req, res) => {
       return true;
     });
 
-    // Exclude reserved resources by other events on the same day.
+    // Mark reserved resources by other events on the same day.
     // - Venue: lock is service-level (serviceId)
     // - Other categories: lock is vendor-level (vendorAuthId)
     if (reservationDays.length > 0) {
@@ -1157,61 +1435,74 @@ const getVendorsForPlanning = async (req, res) => {
           excludeEventId: eventId.trim(),
         });
 
-        if (reservedServiceIds.length > 0) {
-          const reservedServiceSet = new Set(
-            reservedServiceIds
-              .map((id) => String(id || '').trim())
-              .filter(Boolean)
-          );
+        const reservedServiceSet = new Set(
+          reservedServiceIds
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+        );
 
-          items = items
-            .map((v) => {
-              const services = Array.isArray(v?.services) ? v.services : [];
-              const filteredServices = services.filter((s) => {
-                const sid = String(s?.serviceId || '').trim();
-                if (!sid) return false;
-                return !reservedServiceSet.has(sid);
-              });
+        items = items
+          .map((v) => {
+            const services = Array.isArray(v?.services) ? v.services : [];
+            if (services.length === 0) return null;
 
-              if (filteredServices.length === 0) return null;
-
-              const prices = filteredServices
-                .map((s) => ({
-                  min: toNumber(s.priceMin, null),
-                  max: toNumber(s.priceMax, null),
-                }));
-
-              const minPrices = prices.map((p) => p.min).filter((p) => p != null);
-              const maxPrices = prices.map((p) => p.max).filter((p) => p != null);
-
+            const mappedServices = services.map((s) => {
+              const sid = String(s?.serviceId || '').trim();
+              const isLocked = sid ? reservedServiceSet.has(sid) : false;
               return {
-                ...v,
-                services: filteredServices,
-                priceMin: minPrices.length ? Math.min(...minPrices) : v.priceMin,
-                priceMax: maxPrices.length ? Math.max(...maxPrices) : v.priceMax,
+                ...s,
+                isAvailable: !isLocked,
+                unavailableReason: isLocked ? 'CURRENTLY_LOCKED_WITH_ANOTHER_EVENT' : null,
               };
-            })
-            .filter(Boolean);
-        }
+            });
+
+            const hasAnyAvailableService = mappedServices.some((s) => s?.isAvailable !== false);
+
+            return {
+              ...v,
+              services: mappedServices,
+              isAvailable: hasAnyAvailableService,
+              unavailableReason: hasAnyAvailableService ? null : 'CURRENTLY_LOCKED_WITH_ANOTHER_EVENT',
+            };
+          })
+          .filter(Boolean);
       } else {
         const reserved = await vendorReservationService.listReservedVendorAuthIdsForDays({
           days: reservationDays,
           excludeEventId: eventId.trim(),
         });
 
-        if (reserved.length > 0) {
-          const reservedSet = new Set(
-            reserved
-              .map((id) => String(id || '').trim())
-              .filter(Boolean)
-          );
-          items = items.filter((v) => {
+        const reservedSet = new Set(
+          reserved
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+        );
+
+        items = items
+          .map((v) => {
             const vendorAuthId = String(v?.vendorAuthId || '').trim();
-            if (!vendorAuthId) return false;
-            return !reservedSet.has(vendorAuthId);
-          });
-        }
+            const isLocked = vendorAuthId ? reservedSet.has(vendorAuthId) : false;
+            return {
+              ...v,
+              isAvailable: !isLocked,
+              unavailableReason: isLocked ? 'CURRENTLY_LOCKED_WITH_ANOTHER_EVENT' : null,
+            };
+          })
+          .filter((v) => Boolean(String(v?.vendorAuthId || '').trim()));
       }
+    } else {
+      items = items.map((v) => ({
+        ...v,
+        isAvailable: true,
+        unavailableReason: null,
+        services: Array.isArray(v?.services)
+          ? v.services.map((s) => ({
+            ...s,
+            isAvailable: true,
+            unavailableReason: null,
+          }))
+          : v?.services,
+      }));
     }
 
     if (sortKey === 'nearest') {
@@ -1237,6 +1528,14 @@ const getVendorsForPlanning = async (req, res) => {
         const ta = a.latestCreatedAt ? new Date(a.latestCreatedAt).getTime() : 0;
         const tb = b.latestCreatedAt ? new Date(b.latestCreatedAt).getTime() : 0;
         return tb - ta;
+      });
+    }
+
+    if (includeUnavailableVendors) {
+      items = [...items].sort((a, b) => {
+        const aUnavailable = a?.isAvailable === false ? 1 : 0;
+        const bUnavailable = b?.isAvailable === false ? 1 : 0;
+        return aUnavailable - bUnavailable;
       });
     }
 
@@ -1267,8 +1566,11 @@ module.exports = {
   getMyPlannings,
   getPlanningByEventId,
   getPlanningQuoteLatest,
+  sendPlanningQuoteEmail,
   getAllPlannings,
   updatePlanningStatus,
+  markPlanningAsComplete,
+  submitPlanningFeedback,
   unassignPlanningManager,
   getAdminDashboard,
   confirmPlanning,
@@ -1281,4 +1583,6 @@ module.exports = {
   syncPlanningReservationDay,
   addPlanningCoreStaff,
   removePlanningCoreStaff,
+  releasePlanningGeneratedRevenuePayout,
+  triggerPlanningEmailBlastPromotionAction,
 };

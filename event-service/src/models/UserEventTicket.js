@@ -1,6 +1,11 @@
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
-const { USER_TICKET_STATUS_VALUES, USER_TICKET_STATUS } = require('../utils/ticketConstants');
+const {
+  USER_TICKET_STATUS_VALUES,
+  USER_TICKET_STATUS,
+  USER_TICKET_VERIFICATION_STATUS,
+  USER_TICKET_VERIFICATION_STATUS_VALUES,
+} = require('../utils/ticketConstants');
 
 const TicketTierSnapshotSchema = new mongoose.Schema(
   {
@@ -17,6 +22,20 @@ const EventBannerSnapshotSchema = new mongoose.Schema(
     publicId: { type: String, trim: true, default: null },
     mimeType: { type: String, trim: true, default: null },
     sizeBytes: { type: Number, min: 0, default: null },
+  },
+  { _id: false }
+);
+
+const TicketScanHistorySchema = new mongoose.Schema(
+  {
+    scannedAt: { type: Date, required: true },
+    scannedByAuthId: { type: String, trim: true, default: null },
+    scannedByRole: { type: String, trim: true, default: null },
+    outcome: {
+      type: String,
+      enum: ['VERIFIED', 'ALREADY_SCANNED'],
+      required: true,
+    },
   },
   { _id: false }
 );
@@ -80,6 +99,12 @@ const UserEventTicketSchema = new mongoose.Schema(
       noOfTickets: { type: Number, min: 1, required: true },
       ticketType: { type: String, enum: ['free', 'paid'], required: true },
       tiers: { type: [TicketTierSnapshotSchema], default: [] },
+      selectedDay: {
+        type: String,
+        trim: true,
+        default: null,
+        match: /^\d{4}-\d{2}-\d{2}$/,
+      },
       unitPrice: { type: Number, min: 0, default: 0 },
       totalAmount: { type: Number, min: 0, default: 0 },
       currency: { type: String, trim: true, default: 'INR' },
@@ -95,6 +120,36 @@ const UserEventTicketSchema = new mongoose.Schema(
       enum: USER_TICKET_STATUS_VALUES,
       default: USER_TICKET_STATUS.PAYMENT_REQUIRED,
       index: true,
+    },
+    verification: {
+      status: {
+        type: String,
+        enum: USER_TICKET_VERIFICATION_STATUS_VALUES,
+        default: USER_TICKET_VERIFICATION_STATUS.PENDING,
+        index: true,
+      },
+      verifiedAt: {
+        type: Date,
+        default: null,
+      },
+      verifiedByAuthId: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      lastScannedAt: {
+        type: Date,
+        default: null,
+      },
+      scanCount: {
+        type: Number,
+        min: 0,
+        default: 0,
+      },
+      scanHistory: {
+        type: [TicketScanHistorySchema],
+        default: [],
+      },
     },
 
     expiresAt: {

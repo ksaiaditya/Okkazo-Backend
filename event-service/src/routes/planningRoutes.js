@@ -68,6 +68,13 @@ router.get(
   planningController.getPlanningQuoteLatest
 );
 
+// POST /planning/:eventId/quote/send-email - Manually send quotation email (Manager/Admin)
+router.post(
+  '/planning/:eventId/quote/send-email',
+  isAdminOrManager,
+  planningController.sendPlanningQuoteEmail
+);
+
 // GET /planning/:eventId - Get a single planning by eventId
 router.get(
   '/planning/:eventId',
@@ -103,6 +110,20 @@ router.delete(
   planningController.removePlanningCoreStaff
 );
 
+// PATCH /planning/:eventId/generated-revenue-payout - Release generated revenue to user (demo)
+router.patch(
+  '/planning/:eventId/generated-revenue-payout',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  planningController.releasePlanningGeneratedRevenuePayout
+);
+
+// POST /planning/:eventId/promotion-actions/email-blast - Trigger email blast promotion
+router.post(
+  '/planning/:eventId/promotion-actions/email-blast',
+  authorizeRoles(['MANAGER', 'ADMIN']),
+  planningController.triggerPlanningEmailBlastPromotionAction
+);
+
 // GET /planning/:eventId/vendors - Fetch vendors for a service category
 router.get(
   '/planning/:eventId/vendors',
@@ -122,6 +143,20 @@ router.patch(
   '/planning/:eventId/status',
   isAdminOrManager,
   planningController.updatePlanningStatus
+);
+
+// PATCH /planning/:eventId/mark-complete - Mark private planning as completed (Owner/Assigned Manager)
+router.patch(
+  '/planning/:eventId/mark-complete',
+  authorizeRoles(['USER', 'MANAGER']),
+  planningController.markPlanningAsComplete
+);
+
+// PATCH /planning/:eventId/feedback - Submit post-completion feedback (Owner)
+router.patch(
+  '/planning/:eventId/feedback',
+  authorizeRoles(['USER']),
+  planningController.submitPlanningFeedback
 );
 
 // PATCH /planning/:eventId/unassign-manager - Unassign manager (Admin only)

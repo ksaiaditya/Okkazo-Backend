@@ -149,6 +149,256 @@ const TicketDayAllocationSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const ChangeRequestAffectedServiceSchema = new mongoose.Schema(
+  {
+    service: {
+      type: String,
+      trim: true,
+      enum: SERVICE_OPTIONS,
+      required: true,
+    },
+    previousVendorAuthId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    previousServiceId: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    requiresVendorConsent: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  { _id: false }
+);
+
+const ChangeRequestVendorConsentSchema = new mongoose.Schema(
+  {
+    vendorAuthId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    status: {
+      type: String,
+      required: true,
+      enum: ['PENDING', 'APPROVED', 'REJECTED'],
+      default: 'PENDING',
+      trim: true,
+    },
+    note: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    at: {
+      type: Date,
+      default: null,
+    },
+  },
+  { _id: false }
+);
+
+const PlanningChangeRequestSchema = new mongoose.Schema(
+  {
+    requestId: {
+      type: String,
+      required: true,
+      default: () => uuidv4(),
+      trim: true,
+      index: true,
+    },
+    type: {
+      type: String,
+      required: true,
+      enum: ['SERVICE_CHANGE', 'VENDOR_CHANGE'],
+      default: 'SERVICE_CHANGE',
+      trim: true,
+    },
+    status: {
+      type: String,
+      required: true,
+      enum: [
+        'PENDING_MANAGER_APPROVAL',
+        'PENDING_VENDOR_CONSENT',
+        'APPROVED',
+        'REJECTED',
+        'CANCELLED',
+      ],
+      default: 'PENDING_MANAGER_APPROVAL',
+      trim: true,
+      index: true,
+    },
+    requestedByAuthId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    requestedByRole: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    reason: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    emergencyOverride: {
+      type: Boolean,
+      default: false,
+    },
+    emergencyReason: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    serviceDelta: {
+      added: {
+        type: [String],
+        default: [],
+      },
+      removed: {
+        type: [String],
+        default: [],
+      },
+    },
+    proposedSelectedServices: {
+      type: [String],
+      default: [],
+    },
+    affectedAcceptedServices: {
+      type: [ChangeRequestAffectedServiceSchema],
+      default: [],
+    },
+    vendorConsents: {
+      type: [ChangeRequestVendorConsentSchema],
+      default: [],
+    },
+    priceDelta: {
+      currentGrandTotalPaise: {
+        type: Number,
+        min: 0,
+        default: 0,
+      },
+      proposedGrandTotalPaise: {
+        type: Number,
+        min: 0,
+        default: 0,
+      },
+      deltaPaise: {
+        type: Number,
+        default: 0,
+      },
+      suggestedAdjustmentFeePaise: {
+        type: Number,
+        min: 0,
+        default: 0,
+      },
+    },
+    managerDecision: {
+      byAuthId: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      at: {
+        type: Date,
+        default: null,
+      },
+      note: {
+        type: String,
+        trim: true,
+        maxlength: 1000,
+        default: null,
+      },
+    },
+    vendorConsent: {
+      status: {
+        type: String,
+        enum: ['NOT_REQUIRED', 'PENDING', 'APPROVED', 'REJECTED'],
+        default: 'NOT_REQUIRED',
+        trim: true,
+      },
+      note: {
+        type: String,
+        trim: true,
+        maxlength: 1000,
+        default: null,
+      },
+      at: {
+        type: Date,
+        default: null,
+      },
+    },
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { _id: false }
+);
+
+const PlanningPlatformFeedbackSchema = new mongoose.Schema(
+  {
+    rating: {
+      type: Number,
+      min: 1,
+      max: 5,
+      required: true,
+    },
+    review: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    submittedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { _id: false }
+);
+
+const PlanningVendorFeedbackSchema = new mongoose.Schema(
+  {
+    vendorAuthId: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    service: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    rating: {
+      type: Number,
+      min: 1,
+      max: 5,
+      required: true,
+    },
+    review: {
+      type: String,
+      trim: true,
+      maxlength: 1000,
+      default: null,
+    },
+    submittedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+  { _id: false }
+);
+
 const PlanningSchema = new mongoose.Schema(
   {
     eventId: {
@@ -285,6 +535,10 @@ const PlanningSchema = new mongoose.Schema(
       ],
       default: [],
     },
+    changeRequests: {
+      type: [PlanningChangeRequestSchema],
+      default: [],
+    },
     isUrgent: {
       type: Boolean,
       default: false,
@@ -347,6 +601,80 @@ const PlanningSchema = new mongoose.Schema(
     vendorConfirmationPaidAt: {
       type: Date,
       default: null,
+    },
+
+    remainingPaymentPaid: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    remainingPaymentPaidAmountPaise: {
+      type: Number,
+      default: null,
+      min: 0,
+    },
+    remainingPaymentPaidCurrency: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    remainingPaymentPaidAt: {
+      type: Date,
+      default: null,
+    },
+
+    generatedRevenuePayout: {
+      mode: {
+        type: String,
+        enum: ['DEMO', 'RAZORPAY'],
+        default: null,
+      },
+      status: {
+        type: String,
+        enum: ['PENDING', 'SUCCESS', 'FAILED'],
+        default: null,
+      },
+      amountPaise: {
+        type: Number,
+        min: 0,
+        default: null,
+      },
+      currency: {
+        type: String,
+        trim: true,
+        default: 'INR',
+      },
+      paidAt: {
+        type: Date,
+        default: null,
+      },
+      paidByAuthId: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      transactionRef: {
+        type: String,
+        trim: true,
+        default: null,
+      },
+      notes: {
+        type: String,
+        trim: true,
+        maxlength: 500,
+        default: null,
+      },
+    },
+
+    feedback: {
+      platform: {
+        type: PlanningPlatformFeedbackSchema,
+        default: null,
+      },
+      vendors: {
+        type: [PlanningVendorFeedbackSchema],
+        default: [],
+      },
     },
 
     quoteLockedAt: {

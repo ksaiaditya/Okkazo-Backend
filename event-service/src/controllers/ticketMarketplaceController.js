@@ -1,4 +1,5 @@
 const ticketMarketplaceService = require('../services/ticketMarketplaceService');
+const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 
 const getTicketMarketplaceEvents = async (req, res) => {
@@ -51,6 +52,7 @@ const prepareTicketPurchase = async (req, res) => {
       userAuthId: req.user?.authId,
       userId: req.user?.userId,
       tiers: req.body?.tiers,
+      selectedDay: req.body?.selectedDay,
     });
 
     return res.status(201).json({
@@ -128,14 +130,60 @@ const getMyTickets = async (req, res) => {
   }
 };
 
-const verifyTicketQr = async (req, res) => {
+const getEventTicketGuests = async (req, res) => {
   try {
-    const result = await ticketMarketplaceService.verifyTicketQr({
-      token: req.body?.token,
+    const result = await ticketMarketplaceService.getEventTicketGuests({
+      eventId: req.params?.eventId,
+      page: req.query?.page,
+      limit: req.query?.limit,
+      query: req.query?.query,
     });
 
     return res.status(200).json({
       success: true,
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in getEventTicketGuests:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to fetch event guests',
+    });
+  }
+};
+
+const verifyTicketQr = async (req, res) => {
+  try {
+    const result = await ticketMarketplaceService.verifyTicketQr({
+      token: req.body?.token,
+      scannedByAuthId: req.user?.authId,
+      scannedByRole: req.user?.role,
+    });
+
+    if (!result?.alreadyScanned) {
+      try {
+        await publishEvent('TICKET_VERIFIED', {
+          eventId: result?.eventId || null,
+          authId: result?.userAuthId || null,
+          ticketId: result?.ticketId || null,
+          eventTitle: result?.eventTitle || null,
+          verifiedAt: result?.verifiedAt || new Date().toISOString(),
+          selectedDay: result?.selectedDay || null,
+          scannedByAuthId: req.user?.authId || null,
+          scannedByRole: req.user?.role || null,
+        });
+      } catch (publishError) {
+        logger.warn('Failed to publish TICKET_VERIFIED event', {
+          ticketId: result?.ticketId || null,
+          eventId: result?.eventId || null,
+          message: publishError?.message || String(publishError),
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: result?.alreadyScanned ? "It's already scanned" : 'Ticket verified successfully',
       data: result,
     });
   } catch (error) {
@@ -154,5 +202,6 @@ module.exports = {
   confirmFreeTicketPurchase,
   getMyTickets,
   getMyTicketByTicketId,
+  getEventTicketGuests,
   verifyTicketQr,
 };

@@ -12,6 +12,13 @@ router.get(
   vendorSelectionController.listVendorRequests
 );
 
+// GET /vendor/requests/ledger - Vendor payout ledger across events
+router.get(
+  '/vendor/requests/ledger',
+  authorizeRoles(['VENDOR']),
+  vendorSelectionController.listVendorPayoutLedger
+);
+
 // GET /vendor/requests/:eventId - Get vendor event request details
 router.get(
   '/vendor/requests/:eventId',
@@ -66,6 +73,27 @@ router.patch(
   '/vendor-selection/:eventId/vendors',
   authorizeRoles(['USER', 'VENDOR', 'ADMIN', 'MANAGER']),
   vendorSelectionController.upsertVendor
+);
+
+// POST /vendor-selection/:eventId/change-request - Submit service change request for managed approval flow
+router.post(
+  '/vendor-selection/:eventId/change-request',
+  authorizeRoles(['USER', 'ADMIN', 'MANAGER']),
+  vendorSelectionController.createServiceChangeRequest
+);
+
+// PATCH /vendor-selection/:eventId/change-request/:requestId/manager-decision - Manager/Admin decision
+router.patch(
+  '/vendor-selection/:eventId/change-request/:requestId/manager-decision',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  vendorSelectionController.decideServiceChangeRequestByManager
+);
+
+// PATCH /vendor-selection/:eventId/change-request/:requestId/vendor-consent - Vendor consent/rejection
+router.patch(
+  '/vendor-selection/:eventId/change-request/:requestId/vendor-consent',
+  authorizeRoles(['VENDOR']),
+  vendorSelectionController.submitVendorConsentForServiceChangeRequest
 );
 
 // POST /vendor-selection/:eventId/unlock - Release temporary reservation locks

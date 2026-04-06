@@ -42,6 +42,12 @@ router.get(
   ticketMarketplaceController.getMyTicketByTicketId
 );
 
+router.get(
+  '/tickets/events/:eventId/guests',
+  authorizeRoles(['ADMIN', 'MANAGER']),
+  ticketMarketplaceController.getEventTicketGuests
+);
+
 router.post(
   '/tickets/verify-qr',
   authorizeRoles(['VENDOR', 'ADMIN', 'MANAGER']),

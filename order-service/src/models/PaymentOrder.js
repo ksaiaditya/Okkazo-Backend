@@ -17,7 +17,7 @@ const PaymentOrderSchema = new mongoose.Schema(
     },
     orderType: {
       type: String,
-      enum: ['PLANNING EVENT', 'PLANNING EVENT DEPOSIT FEE', 'PLANNING EVENT VENDOR CONFIRMATION FEE', 'PROMOTE EVENT', 'TICKET SALE', 'REFUND'],
+      enum: ['PLANNING EVENT', 'PLANNING EVENT DEPOSIT FEE', 'PLANNING EVENT VENDOR CONFIRMATION FEE', 'PLANNING EVENT REMAINING FEE', 'PROMOTE EVENT', 'TICKET SALE', 'REFUND'],
       required: true,
       index: true,
     },

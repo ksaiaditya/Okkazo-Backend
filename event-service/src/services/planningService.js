@@ -1,17 +1,28 @@
 const Planning = require('../models/Planning');
 const Promote = require('../models/Promote');
+const UserEventTicket = require('../models/UserEventTicket');
 const VendorSelection = require('../models/VendorSelection');
+const axios = require('axios');
 const logger = require('../utils/logger');
 const createApiError = require('../utils/ApiError');
-const { STATUS, STATUS_VALUES, CATEGORY } = require('../utils/planningConstants');
+const {
+  STATUS,
+  STATUS_VALUES,
+  CATEGORY,
+  TERMINAL_STATUSES,
+  USER_HIDDEN_STATUSES,
+} = require('../utils/planningConstants');
 const { PROMOTE_STATUS, ADMIN_DECISION_STATUS } = require('../utils/promoteConstants');
+const { USER_TICKET_STATUS } = require('../utils/ticketConstants');
 const vendorSelectionService = require('./vendorSelectionService');
 const vendorReservationService = require('./vendorReservationService');
 const promoteConfigService = require('./promoteConfigService');
 const planningQuoteService = require('./planningQuoteService');
 const mongoose = require('mongoose');
-const { fetchUserById } = require('./userServiceClient');
+const { fetchUserById, resolveUserServiceIdFromAuthId } = require('./userServiceClient');
 const { ensureEventChatSeeded } = require('./chatSeedService');
+const { sendEventDmConversationMessage } = require('./chatServiceClient');
+const { publishEvent } = require('../kafka/eventProducer');
 const {
   parseIstDayStart,
   shiftDateKeepingIstTime,
@@ -23,7 +34,63 @@ const REQUIRED_DEPARTMENT_BY_PLANNING_CATEGORY = {
   [CATEGORY.PRIVATE]: 'Private Event',
 };
 
+const defaultOrderServiceUrl = process.env.SERVICE_HOST
+  ? 'http://order-service:8087'
+  : 'http://localhost:8087';
+const orderServiceUrl = process.env.ORDER_SERVICE_URL || defaultOrderServiceUrl;
+const upstreamTimeoutMs = parseInt(process.env.UPSTREAM_HTTP_TIMEOUT_MS || '10000', 10);
+
+const resolveFrontendBaseUrl = () => {
+  const fromEnv = String(process.env.FRONTEND_URL || process.env.FRONTEND_URL_FALLBACK || '').trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, '');
+  return 'http://localhost:5173';
+};
+
 const normalizeLoose = (value) => String(value || '').trim().toLowerCase();
+
+const normalizePromotionToken = (value) => String(value || '')
+  .trim()
+  .toLowerCase()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ');
+
+const hasPromotionSelected = (rows, promotionName) => {
+  const target = normalizePromotionToken(promotionName);
+  if (!target) return false;
+
+  const list = Array.isArray(rows) ? rows : [];
+  return list.some((row) => normalizePromotionToken(row) === target);
+};
+
+const buildInternalOrderServiceHeaders = () => ({
+  'x-auth-id': 'event-service',
+  'x-user-id': '',
+  'x-user-email': '',
+  'x-user-username': 'event-service',
+  'x-user-role': 'MANAGER',
+});
+
+const fetchVendorPayoutsForEventFromOrderService = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return [];
+
+  const response = await axios.get(
+    `${orderServiceUrl}/orders/vendor-payouts/event/${encodeURIComponent(normalizedEventId)}`,
+    {
+      timeout: upstreamTimeoutMs,
+      headers: buildInternalOrderServiceHeaders(),
+    }
+  );
+
+  return Array.isArray(response?.data?.data?.payouts) ? response.data.data.payouts : [];
+};
+
+const toVendorServicePayoutKey = ({ vendorAuthId, service }) => {
+  const vendorKey = String(vendorAuthId || '').trim().toLowerCase();
+  const serviceKey = String(service || '').trim().toLowerCase();
+  if (!vendorKey || !serviceKey) return null;
+  return `${vendorKey}::${serviceKey}`;
+};
 
 const ensureStickyVendorReservationsForPlanning = async (planning) => {
   const eid = String(planning?.eventId || '').trim();
@@ -95,23 +162,27 @@ const isAssignedRoleEligible = (assignedRole) => {
   return role.includes('junior') || role.includes('senior');
 };
 
-const toDateOrNull = (value) => {
-  if (!value) return null;
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d;
+const isCoordinatorAssignedRole = (assignedRole) => {
+  if (!assignedRole) return false;
+  const role = normalizeLoose(assignedRole);
+  return role.includes('coordinator');
 };
 
-const normalizeRange = (range) => {
-  const start = toDateOrNull(range?.start);
-  const end = toDateOrNull(range?.end) || start;
+const normalizeRangeToIstDaySpan = (range) => {
+  const startDay = toIstDayString(range?.start);
+  const endDay = toIstDayString(range?.end || range?.start);
+  if (!startDay || !endDay) return null;
+
+  const start = parseIstDayStart(startDay);
+  const end = parseIstDayStart(endDay);
   if (!start || !end) return null;
   if (end < start) return { start, end: start };
   return { start, end };
 };
 
 const rangesOverlap = (a, b) => {
-  const ra = normalizeRange(a);
-  const rb = normalizeRange(b);
+  const ra = normalizeRangeToIstDaySpan(a);
+  const rb = normalizeRangeToIstDaySpan(b);
 
   // If either side is malformed/missing schedule, keep conservative behavior and block.
   if (!ra || !rb) return true;
@@ -137,6 +208,77 @@ const promoteToRange = (promote) => ({
   start: promote?.schedule?.startAt,
   end: promote?.schedule?.endAt,
 });
+
+const assertCoreStaffEligibleForPlanning = async ({ staffId } = {}) => {
+  const normalizedStaffId = String(staffId || '').trim();
+  if (!normalizedStaffId) throw createApiError(400, 'staffId is required');
+
+  const user = await fetchUserById(normalizedStaffId);
+  if (!user) throw createApiError(404, 'Staff member not found in user-service');
+
+  if (normalizeLoose(user?.role) !== 'manager') {
+    throw createApiError(400, 'Selected staff member is not a MANAGER');
+  }
+
+  if (!isCoordinatorAssignedRole(user?.assignedRole)) {
+    throw createApiError(400, 'Only MANAGER with assignedRole COORDINATOR can be added as team staff');
+  }
+
+  if (user?.isActive === false) {
+    throw createApiError(400, 'Selected staff member is not active');
+  }
+
+  return user;
+};
+
+const assertCoreStaffAvailableAcrossEvents = async ({ staffId, targetRange, planningEventIdToExclude } = {}) => {
+  const normalizedStaffId = String(staffId || '').trim();
+  if (!normalizedStaffId) throw createApiError(400, 'staffId is required');
+
+  const normalizedExcludeEventId = String(planningEventIdToExclude || '').trim();
+
+  const [existingPlannings, existingPromotes] = await Promise.all([
+    Planning.find({
+      status: { $nin: TERMINAL_STATUSES },
+      ...(normalizedExcludeEventId ? { eventId: { $ne: normalizedExcludeEventId } } : {}),
+      $or: [
+        { assignedManagerId: normalizedStaffId },
+        { coreStaffIds: normalizedStaffId },
+      ],
+    })
+      .select('eventId category schedule eventDate')
+      .lean(),
+    Promote.find({
+      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
+      'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
+      ...(normalizedExcludeEventId ? { eventId: { $ne: normalizedExcludeEventId } } : {}),
+      $or: [
+        { assignedManagerId: normalizedStaffId },
+        { coreStaffIds: normalizedStaffId },
+      ],
+    })
+      .select('eventId schedule')
+      .lean(),
+  ]);
+
+  const hasPlanningConflict = (existingPlannings || []).some((row) => {
+    if (!targetRange) return true;
+    return rangesOverlap(targetRange, planningToRange(row));
+  });
+
+  if (hasPlanningConflict) {
+    throw createApiError(409, 'Coordinator is already assigned to another event for overlapping dates');
+  }
+
+  const hasPromoteConflict = (existingPromotes || []).some((row) => {
+    if (!targetRange) return true;
+    return rangesOverlap(targetRange, promoteToRange(row));
+  });
+
+  if (hasPromoteConflict) {
+    throw createApiError(409, 'Coordinator is already assigned to another event for overlapping dates');
+  }
+};
 
 const assertManagerEligibleForPlanning = async ({ managerId, planningCategory } = {}) => {
   const user = await fetchUserById(managerId);
@@ -190,7 +332,7 @@ const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdTo
 
   const planningQuery = {
     assignedManagerId: String(managerId).trim(),
-    status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+    status: { $nin: TERMINAL_STATUSES },
   };
   if (planningEventIdToExclude) {
     planningQuery.eventId = { $ne: String(planningEventIdToExclude).trim() };
@@ -208,7 +350,7 @@ const assertManagerAvailableAcrossEvents = async ({ managerId, planningEventIdTo
   }
 };
 
-const normalizePlanningForApi = (planning, platformFeeFallback) => {
+const normalizePlanningForApi = (planning, platformFeeFallback, viewerRole = null) => {
   if (!planning) return planning;
 
   const normalized = {
@@ -216,6 +358,10 @@ const normalizePlanningForApi = (planning, platformFeeFallback) => {
     platformFeePaid: Boolean(planning.platformFeePaid) || Boolean(planning.isPaid),
     depositPaid: Boolean(planning.depositPaid),
     vendorConfirmationPaid: Boolean(planning.vendorConfirmationPaid),
+    remainingPaymentPaid: Boolean(planning.remainingPaymentPaid),
+    remainingPaymentPaidAmountPaise: Number(planning.remainingPaymentPaidAmountPaise || 0),
+    remainingPaymentPaidCurrency: planning.remainingPaymentPaidCurrency || 'INR',
+    remainingPaymentPaidAt: planning.remainingPaymentPaidAt || null,
     fullPaymentPaid: Boolean(planning.fullPaymentPaid),
   };
 
@@ -224,10 +370,180 @@ const normalizePlanningForApi = (planning, platformFeeFallback) => {
     normalized.platformFee = platformFeeFallback;
   }
 
+  const normalizedRole = String(viewerRole || '').trim().toUpperCase();
+  if (normalizedRole === 'USER' && USER_HIDDEN_STATUSES.includes(normalized.status)) {
+    normalized.status = STATUS.COMPLETED;
+  }
+
   // Hide legacy name.
   delete normalized.isPaid;
 
   return normalized;
+};
+
+const toNonNegativeNumber = (value) => {
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+};
+
+const computePlanningVendorCostInr = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) return 0;
+
+  const selection = await VendorSelection.findOne({ eventId: normalizedEventId })
+    .select('vendors')
+    .lean();
+
+  const rows = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  return rows.reduce((sum, row) => {
+    const isLocked = Boolean(row?.priceLocked) && Number(row?.vendorQuotedPrice || 0) > 0;
+    if (!isLocked) return sum;
+
+    const lockedPrice = toNonNegativeNumber(row?.vendorQuotedPrice);
+    const commissionAmount = toNonNegativeNumber(row?.commissionAmount);
+    const vendorPayout = Math.max(0, lockedPrice - commissionAmount);
+    return sum + vendorPayout;
+  }, 0);
+};
+
+const resolvePlanningTicketCapacity = (planning) => {
+  const topLevelCount = toNonNegativeNumber(planning?.tickets?.totalTickets);
+  if (topLevelCount > 0) return topLevelCount;
+
+  const dayWise = Array.isArray(planning?.tickets?.dayWiseAllocations)
+    ? planning.tickets.dayWiseAllocations
+    : [];
+
+  const dayWiseCount = dayWise.reduce((sum, row) => {
+    const count = Number(row?.ticketCount || 0);
+    return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+  }, 0);
+  if (dayWiseCount > 0) return dayWiseCount;
+
+  const tiers = Array.isArray(planning?.tickets?.tiers) ? planning.tickets.tiers : [];
+  const tierCount = tiers.reduce((sum, tier) => {
+    const count = Number(tier?.ticketCount || 0);
+    return sum + (Number.isFinite(count) && count > 0 ? count : 0);
+  }, 0);
+  if (tierCount > 0) return tierCount;
+
+  return toNonNegativeNumber(planning?.tickets?.totalTickets);
+};
+
+const buildPlanningTicketSalesStats = async (planning, feesConfig = {}) => {
+  const eventId = String(planning?.eventId || '').trim();
+  const remainingTickets = resolvePlanningTicketCapacity(planning);
+  const configuredPlatformFeeInr = toNonNegativeNumber(
+    planning?.platformFee ?? feesConfig?.platformFee
+  );
+  const serviceChargePercentRaw = Number(feesConfig?.serviceChargePercent);
+  const serviceChargePercent = Number.isFinite(serviceChargePercentRaw)
+    ? Math.max(0, Math.min(100, serviceChargePercentRaw))
+    : 0;
+
+  if (!eventId) {
+    return {
+      totalTickets: remainingTickets,
+      ticketsSold: 0,
+      ticketsRemaining: remainingTickets,
+      conversionRatePercent: 0,
+      ticketSubtotalInr: 0,
+      serviceChargePercent,
+      serviceChargeInr: 0,
+      serviceFeeInr: 0,
+      processingFeeInr: 0,
+      grossRevenueInr: 0,
+      platformFeeInr: configuredPlatformFeeInr,
+      totalFeesInr: configuredPlatformFeeInr,
+      netPnlInr: 0,
+      currency: 'INR',
+    };
+  }
+
+  const [soldRows, generatedAgg] = await Promise.all([
+    UserEventTicket.find({
+      eventId,
+      ticketStatus: USER_TICKET_STATUS.SUCCESS,
+    })
+      .select('tickets.noOfTickets tickets.totalAmount')
+      .lean(),
+    UserEventTicket.aggregate([
+      {
+        $match: {
+          eventId,
+          ticketStatus: { $nin: [USER_TICKET_STATUS.CANCELED, USER_TICKET_STATUS.EXPIRED] },
+        },
+      },
+      {
+        $group: {
+          _id: '$eventId',
+          generatedTickets: { $sum: '$tickets.noOfTickets' },
+        },
+      },
+    ]),
+  ]);
+
+  const toPaise = (inr) => {
+    const value = Number(inr || 0);
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return Math.round(value * 100);
+  };
+
+  let successfulTicketsSold = 0;
+  let subtotalPaise = 0;
+
+  for (const row of soldRows || []) {
+    const quantityRaw = Number(row?.tickets?.noOfTickets || 0);
+    const quantity = Number.isFinite(quantityRaw) && quantityRaw > 0 ? Math.floor(quantityRaw) : 0;
+    successfulTicketsSold += quantity;
+
+    const lineSubtotalPaise = toPaise(row?.tickets?.totalAmount);
+    subtotalPaise += lineSubtotalPaise;
+  }
+
+  const generatedRow = Array.isArray(generatedAgg) && generatedAgg.length > 0 ? generatedAgg[0] : null;
+  const generatedTickets = toNonNegativeNumber(generatedRow?.generatedTickets);
+
+  // KPI consistency rule:
+  // total capacity = current remaining in planning + tickets generated for this event.
+  const ticketsSold = generatedTickets;
+  const totalTickets = Math.max(remainingTickets, remainingTickets + ticketsSold);
+
+  const grossRevenuePaise = subtotalPaise;
+  const serviceChargePaise = Math.round(subtotalPaise * (serviceChargePercent / 100));
+  const platformFeePaise = toPaise(configuredPlatformFeeInr);
+  const totalFeesPaise = platformFeePaise + serviceChargePaise;
+
+  const ticketSubtotalInr = Number((subtotalPaise / 100).toFixed(2));
+  const serviceChargeInr = Number((serviceChargePaise / 100).toFixed(2));
+  const serviceFeeInr = serviceChargeInr;
+  const processingFeeInr = 0;
+  const grossRevenueInr = Number((grossRevenuePaise / 100).toFixed(2));
+  const platformFeeInr = Number((platformFeePaise / 100).toFixed(2));
+  const totalFeesInr = Number((totalFeesPaise / 100).toFixed(2));
+  const netPnlInr = Number(((grossRevenuePaise - totalFeesPaise) / 100).toFixed(2));
+  const ticketsRemaining = Math.max(0, totalTickets - ticketsSold);
+  const conversionRatePercent = totalTickets > 0
+    ? Number(((ticketsSold / totalTickets) * 100).toFixed(2))
+    : 0;
+
+  return {
+    totalTickets,
+    ticketsSold,
+    successfulTicketsSold,
+    ticketsRemaining,
+    conversionRatePercent,
+    ticketSubtotalInr,
+    serviceChargePercent,
+    serviceChargeInr,
+    serviceFeeInr,
+    processingFeeInr,
+    grossRevenueInr,
+    platformFeeInr,
+    totalFeesInr,
+    netPnlInr,
+    currency: 'INR',
+  };
 };
 
 /**
@@ -258,7 +574,7 @@ const createPlanning = async (payload) => {
 /**
  * Get all plannings for a specific user
  */
-const getPlanningsByAuthId = async (authId, page = 1, limit = 10) => {
+const getPlanningsByAuthId = async (authId, page = 1, limit = 10, viewerRole = null) => {
   if (!authId || authId.trim() === "") {
     throw createApiError(400, "Auth ID is required");
   }
@@ -275,7 +591,7 @@ const getPlanningsByAuthId = async (authId, page = 1, limit = 10) => {
     promoteConfigService.getFees(),
   ]);
 
-  const hydrated = (plannings || []).map((p) => normalizePlanningForApi(p, cfg.platformFee));
+  const hydrated = (plannings || []).map((p) => normalizePlanningForApi(p, cfg.platformFee, viewerRole));
 
   return {
     plannings: hydrated,
@@ -291,7 +607,7 @@ const getPlanningsByAuthId = async (authId, page = 1, limit = 10) => {
 /**
  * Get a single planning by eventId
  */
-const getPlanningByEventId = async (eventId) => {
+const getPlanningByEventId = async (eventId, viewerRole = null) => {
   if (!eventId || eventId.trim() === "") {
     throw createApiError(400, "Event ID is required");
   }
@@ -304,13 +620,48 @@ const getPlanningByEventId = async (eventId) => {
     throw createApiError(404, "Planning not found");
   }
 
-  return normalizePlanningForApi(planning, cfg.platformFee);
+  const normalized = normalizePlanningForApi(planning, cfg.platformFee, viewerRole);
+
+  if (String(normalized?.category || '').trim() === CATEGORY.PUBLIC) {
+    try {
+      normalized.ticketSalesStats = await buildPlanningTicketSalesStats(normalized, cfg);
+    } catch (error) {
+      logger.warn('Failed to compute planning ticket sales stats', {
+        eventId: String(normalized?.eventId || '').trim(),
+        message: error?.message || String(error),
+      });
+      const fallbackPlatformFeeInr = toNonNegativeNumber(normalized?.platformFee ?? cfg?.platformFee);
+      const fallbackServiceChargePercentRaw = Number(cfg?.serviceChargePercent);
+      const fallbackServiceChargePercent = Number.isFinite(fallbackServiceChargePercentRaw)
+        ? Math.max(0, Math.min(100, fallbackServiceChargePercentRaw))
+        : 0;
+      normalized.ticketSalesStats = {
+        totalTickets: resolvePlanningTicketCapacity(normalized),
+        ticketsSold: 0,
+        successfulTicketsSold: 0,
+        ticketsRemaining: resolvePlanningTicketCapacity(normalized),
+        conversionRatePercent: 0,
+        ticketSubtotalInr: 0,
+        serviceChargePercent: fallbackServiceChargePercent,
+        serviceChargeInr: 0,
+        serviceFeeInr: 0,
+        processingFeeInr: 0,
+        grossRevenueInr: 0,
+        platformFeeInr: fallbackPlatformFeeInr,
+        totalFeesInr: fallbackPlatformFeeInr,
+        netPnlInr: 0,
+        currency: 'INR',
+      };
+    }
+  }
+
+  return normalized;
 };
 
 /**
  * Get all plannings with pagination and filters (Admin/Manager)
  */
-const getAllPlannings = async (filters = {}, page = 1, limit = 10) => {
+const getAllPlannings = async (filters = {}, page = 1, limit = 10, viewerRole = null) => {
   const query = {};
 
   if (filters.category) {
@@ -341,7 +692,7 @@ const getAllPlannings = async (filters = {}, page = 1, limit = 10) => {
     promoteConfigService.getFees(),
   ]);
 
-  const hydrated = (plannings || []).map((p) => normalizePlanningForApi(p, cfg.platformFee));
+  const hydrated = (plannings || []).map((p) => normalizePlanningForApi(p, cfg.platformFee, viewerRole));
 
   return {
     plannings: hydrated,
@@ -437,6 +788,133 @@ const updatePlanningStatus = async (
 };
 
 /**
+ * Mark a private planning event as COMPLETED.
+ * Allowed actors:
+ * - planning owner (USER)
+ * - assigned manager (MANAGER)
+ */
+const markPlanningAsComplete = async ({ eventId, actorAuthId, actorUserId, actorRole } = {}) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const normalizedActorAuthId = String(actorAuthId || '').trim();
+  const normalizedActorUserId = String(actorUserId || '').trim();
+  if (!normalizedActorAuthId && !normalizedActorUserId) {
+    throw createApiError(401, 'Actor identity is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  const isOwner = String(planning.authId || '').trim() === normalizedActorAuthId;
+  const assignedManagerId = String(planning.assignedManagerId || '').trim();
+
+  let resolvedManagerUserId = normalizedActorUserId;
+  if (!resolvedManagerUserId && normalizedRole === 'MANAGER' && normalizedActorAuthId) {
+    try {
+      resolvedManagerUserId = String(await resolveUserServiceIdFromAuthId(normalizedActorAuthId) || '').trim();
+    } catch (error) {
+      logger.warn('Failed to resolve manager user id for mark-complete authorization', {
+        eventId: normalizedEventId,
+        actorAuthId: normalizedActorAuthId,
+        message: error?.message,
+      });
+    }
+  }
+
+  let assignedManagerAuthId = '';
+  if (normalizedRole === 'MANAGER' && assignedManagerId && normalizedActorAuthId) {
+    try {
+      const assignedManagerUser = await fetchUserById(assignedManagerId);
+      assignedManagerAuthId = String(assignedManagerUser?.authId || '').trim();
+    } catch (error) {
+      logger.warn('Failed to resolve assigned manager auth id for mark-complete authorization', {
+        eventId: normalizedEventId,
+        assignedManagerId,
+        message: error?.message,
+      });
+    }
+  }
+
+  const isAssignedManager = normalizedRole === 'MANAGER' && (
+    (assignedManagerId && normalizedActorAuthId && assignedManagerId === normalizedActorAuthId)
+    || (assignedManagerId && resolvedManagerUserId && assignedManagerId === resolvedManagerUserId)
+    || (assignedManagerAuthId && normalizedActorAuthId && assignedManagerAuthId === normalizedActorAuthId)
+  );
+
+  if (!isOwner && !isAssignedManager) {
+    logger.warn('Mark-complete authorization rejected', {
+      eventId: normalizedEventId,
+      actorRole: normalizedRole,
+      actorAuthId: normalizedActorAuthId || null,
+      actorUserId: normalizedActorUserId || null,
+      assignedManagerId: assignedManagerId || null,
+      resolvedManagerUserId: resolvedManagerUserId || null,
+      assignedManagerAuthId: assignedManagerAuthId || null,
+      planningOwnerAuthId: String(planning.authId || '').trim() || null,
+    });
+    throw createApiError(403, 'Only the event owner or assigned manager can mark this event as complete');
+  }
+
+  if (String(planning.category || '').trim().toLowerCase() !== CATEGORY.PRIVATE) {
+    throw createApiError(409, 'Mark as complete is currently supported only for private planning events');
+  }
+
+  const currentStatus = String(planning.status || '').trim();
+  if (currentStatus === STATUS.COMPLETED) {
+    return planning;
+  }
+
+  if (currentStatus !== STATUS.CONFIRMED) {
+    throw createApiError(409, 'Only CONFIRMED events can be marked as complete');
+  }
+
+  planning.status = STATUS.COMPLETED;
+  await planning.save({ validateBeforeSave: false });
+  logger.info(`Planning marked as completed: ${normalizedEventId}`);
+
+  // When manager marks a private planning event as complete, notify the owner in DM
+  // to proceed with remaining payment using the event management link.
+  if (normalizedRole === 'MANAGER') {
+    const ownerAuthId = String(planning.authId || '').trim();
+    if (ownerAuthId && normalizedActorAuthId) {
+      const frontendBaseUrl = resolveFrontendBaseUrl();
+      const userEventManagementLink = `${frontendBaseUrl}/user/event-management/${encodeURIComponent(normalizedEventId)}`;
+      const eventTitle = String(planning.eventTitle || '').trim() || `Event ${normalizedEventId}`;
+      const completionMessage = [
+        `Your event \"${eventTitle}\" has been marked as completed successfully.`,
+        'Please pay the remaining amount to close the event.',
+        `Pay now: ${userEventManagementLink}`,
+      ].join('\n');
+
+      try {
+        await sendEventDmConversationMessage({
+          eventId: normalizedEventId,
+          otherAuthId: ownerAuthId,
+          senderAuthId: normalizedActorAuthId,
+          senderRole: 'MANAGER',
+          text: completionMessage,
+        });
+      } catch (error) {
+        logger.warn('Failed to send mark-complete remaining-payment reminder message', {
+          eventId: normalizedEventId,
+          managerAuthId: normalizedActorAuthId,
+          ownerAuthId,
+          message: error?.message || String(error),
+        });
+      }
+    }
+  }
+
+  return planning;
+};
+
+/**
  * Assign a manager to a planning without changing status.
  * This supports admin/manual assignment and auto-assign flows that should not be coupled to an "approval" step.
  */
@@ -513,7 +991,7 @@ const tryAutoAssignPlanningManager = async (eventId, assignedManagerId) => {
     {
       eventId: String(eventId).trim(),
       assignedManagerId: null,
-      status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+      status: { $nin: TERMINAL_STATUSES },
       $or: [{ vendorSelectionId: { $ne: null } }, { platformFeePaid: true }, { isPaid: true }],
     },
     {
@@ -594,7 +1072,7 @@ const getPlanningsForManager = async ({ managerId, limit = 200 } = {}) => {
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
 
   const baseSelect =
-    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee';
+    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
 
   const plannings = await Planning.find({
     assignedManagerId: String(managerId).trim(),
@@ -619,7 +1097,7 @@ const getPlanningApplicationsForManager = async ({ managerId, limit = 200 } = {}
   const safeLimit = Math.min(500, Math.max(1, Number(limit) || 200));
 
   const baseSelect =
-    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee';
+    'eventId eventTitle category eventType customEventType eventField eventBanner schedule eventDate createdAt authId assignedManagerId status isUrgent platformFeePaid isPaid depositPaid depositPaidAmountPaise depositPaidCurrency depositPaidAt vendorConfirmationPaid vendorConfirmationPaidAmountPaise vendorConfirmationPaidCurrency vendorConfirmationPaidAt remainingPaymentPaid remainingPaymentPaidAmountPaise remainingPaymentPaidCurrency remainingPaymentPaidAt fullPaymentPaid vendorSelectionId selectedServices selectedVendors tickets platformFee totalAmount';
 
   const plannings = await Planning.find({
     assignedManagerId: String(managerId).trim(),
@@ -656,22 +1134,30 @@ const updatePlanningDetails = async ({ eventId, updates = {}, actorRole, actorMa
   const nextTitle = updates.eventTitle;
   const nextDescription = updates.eventDescription;
   const nextLocationName = updates.locationName;
+  const setUpdates = {};
 
   if (typeof nextTitle === 'string' && nextTitle.trim()) {
-    planning.eventTitle = nextTitle.trim();
+    setUpdates.eventTitle = nextTitle.trim();
   }
   if (typeof nextDescription === 'string' && nextDescription.trim()) {
-    planning.eventDescription = nextDescription.trim();
+    setUpdates.eventDescription = nextDescription.trim();
   }
   if (typeof nextLocationName === 'string' && nextLocationName.trim()) {
-    planning.location = planning.location || {};
-    planning.location.name = nextLocationName.trim();
+    setUpdates['location.name'] = nextLocationName.trim();
   }
 
-  await planning.save();
+  if (Object.keys(setUpdates).length > 0) {
+    await Planning.updateOne(
+      { _id: planning._id },
+      { $set: setUpdates }
+    );
+  }
+
+  const refreshed = await Planning.findById(planning._id);
+  if (!refreshed) throw createApiError(404, 'Planning not found');
 
   const cfg = await promoteConfigService.getFees();
-  return normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+  return normalizePlanningForApi(refreshed.toJSON(), cfg.platformFee);
 };
 
 /**
@@ -690,7 +1176,7 @@ const updatePlanningReservationDayForOwner = async ({ eventId, authId, day } = {
   const planning = await Planning.findOne({ eventId: trimmedEventId, authId: trimmedAuthId });
   if (!planning) throw createApiError(404, 'Planning not found');
 
-  const blockedStatuses = new Set([STATUS.CONFIRMED, STATUS.COMPLETED, STATUS.REJECTED]);
+  const blockedStatuses = new Set([STATUS.CONFIRMED, ...TERMINAL_STATUSES]);
   const currentStatus = String(planning.status || '').trim();
   if (blockedStatuses.has(currentStatus)) {
     throw createApiError(409, 'Cannot change date for finalized planning status');
@@ -770,8 +1256,9 @@ const addPlanningCoreStaff = async ({ eventId, staffId, actorRole, actorManagerI
   const planning = await Planning.findOne({ eventId: trimmedEventId });
   if (!planning) throw createApiError(404, 'Planning not found');
 
-  if (String(planning.status || '').trim() !== STATUS.CONFIRMED) {
-    throw createApiError(409, 'Staff can only be assigned when planning status is CONFIRMED');
+  const planningStatus = String(planning.status || '').trim();
+  if (TERMINAL_STATUSES.includes(planningStatus)) {
+    throw createApiError(409, 'Staff cannot be assigned for completed or closed planning events');
   }
 
   const normalizedActorId = String(actorManagerId || '').trim();
@@ -780,39 +1267,28 @@ const addPlanningCoreStaff = async ({ eventId, staffId, actorRole, actorManagerI
     throw createApiError(403, 'You are not assigned to this planning');
   }
 
-  // Enforce availability: staff cannot be assigned to other active events.
-  const [conflictPlanning, conflictPromote] = await Promise.all([
-    Planning.findOne({
-      eventId: { $ne: trimmedEventId },
-      status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
-      $or: [
-        { assignedManagerId: trimmedStaffId },
-        { coreStaffIds: trimmedStaffId },
-      ],
-    })
-      .select('eventId')
-      .lean(),
-    Promote.findOne({
-      eventId: { $ne: trimmedEventId },
-      eventStatus: { $ne: PROMOTE_STATUS.COMPLETE },
-      'adminDecision.status': { $ne: ADMIN_DECISION_STATUS.REJECTED },
-      $or: [
-        { assignedManagerId: trimmedStaffId },
-        { coreStaffIds: trimmedStaffId },
-      ],
-    })
-      .select('eventId')
-      .lean(),
-  ]);
+  const staffUser = await assertCoreStaffEligibleForPlanning({ staffId: trimmedStaffId });
+  const targetRange = planningToRange(planning);
 
-  if (conflictPlanning || conflictPromote) {
-    throw createApiError(409, 'Staff is already assigned to another active event');
-  }
+  await assertCoreStaffAvailableAcrossEvents({
+    staffId: trimmedStaffId,
+    targetRange,
+    planningEventIdToExclude: trimmedEventId,
+  });
 
   const existing = Array.isArray(planning.coreStaffIds) ? planning.coreStaffIds.map(String) : [];
   if (!existing.includes(trimmedStaffId)) {
     planning.coreStaffIds = [...existing, trimmedStaffId];
     await planning.save({ validateBeforeSave: false });
+  }
+
+  const staffAuthId = String(staffUser?.authId || '').trim();
+  if (staffAuthId) {
+    ensureEventChatSeeded({
+      eventId: planning.eventId,
+      userAuthId: planning.authId,
+      managerAuthId: staffAuthId,
+    });
   }
 
   const cfg = await promoteConfigService.getFees();
@@ -835,8 +1311,9 @@ const removePlanningCoreStaff = async ({ eventId, staffId, actorRole, actorManag
   const planning = await Planning.findOne({ eventId: trimmedEventId });
   if (!planning) throw createApiError(404, 'Planning not found');
 
-  if (String(planning.status || '').trim() !== STATUS.CONFIRMED) {
-    throw createApiError(409, 'Staff can only be removed when planning status is CONFIRMED');
+  const planningStatus = String(planning.status || '').trim();
+  if (TERMINAL_STATUSES.includes(planningStatus)) {
+    throw createApiError(409, 'Staff cannot be removed for completed or closed planning events');
   }
 
   const normalizedActorId = String(actorManagerId || '').trim();
@@ -852,6 +1329,344 @@ const removePlanningCoreStaff = async ({ eventId, staffId, actorRole, actorManag
 
   const cfg = await promoteConfigService.getFees();
   return normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+};
+
+/**
+ * Release generated ticket revenue to user (demo flow) for public planning events.
+ */
+const releasePlanningGeneratedRevenuePayout = async ({ eventId, actorRole, actorAuthId, actorManagerId, mode = 'DEMO' } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  if (!['MANAGER', 'ADMIN'].includes(normalizedRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can release generated revenue payout');
+  }
+
+  const normalizedMode = String(mode || 'DEMO').trim().toUpperCase();
+  if (!['DEMO', 'RAZORPAY'].includes(normalizedMode)) {
+    throw createApiError(400, 'mode must be either DEMO or RAZORPAY');
+  }
+
+  const planning = await Planning.findOne({ eventId: trimmedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+  const ownerAuthId = String(planning.authId || '').trim();
+
+  const category = String(planning.category || '').trim().toLowerCase();
+  if (category !== CATEGORY.PUBLIC) {
+    throw createApiError(409, 'Generated revenue payout is supported only for public planning events');
+  }
+
+  if (normalizedRole === 'MANAGER') {
+    const normalizedActorManagerId = String(actorManagerId || '').trim();
+    if (!normalizedActorManagerId) throw createApiError(403, 'Manager identity is required');
+    if (String(planning.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+      throw createApiError(403, 'You are not assigned to this planning');
+    }
+  }
+
+  const existingStatus = String(planning?.generatedRevenuePayout?.status || '').trim().toUpperCase();
+  if (existingStatus === 'SUCCESS') {
+    const cfg = await promoteConfigService.getFees();
+    const normalizedExisting = normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+    normalizedExisting.ticketSalesStats = await buildPlanningTicketSalesStats(normalizedExisting, cfg);
+    normalizedExisting.generatedRevenuePayoutSummary = {
+      generatedRevenueInr: toNonNegativeNumber(normalizedExisting?.ticketSalesStats?.grossRevenueInr),
+      totalVendorCostInr: await computePlanningVendorCostInr(trimmedEventId),
+      totalFeesInr: toNonNegativeNumber(normalizedExisting?.ticketSalesStats?.totalFeesInr),
+      payoutAmountInr: Number((Number(planning?.generatedRevenuePayout?.amountPaise || 0) / 100).toFixed(2)),
+      mode: normalizedMode,
+      alreadyProcessed: true,
+    };
+    return normalizedExisting;
+  }
+
+  const cfg = await promoteConfigService.getFees();
+  const normalizedPlanning = normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+  const ticketSalesStats = await buildPlanningTicketSalesStats(normalizedPlanning, cfg);
+
+  const generatedRevenueInr = toNonNegativeNumber(ticketSalesStats?.grossRevenueInr);
+  const totalVendorCostInr = await computePlanningVendorCostInr(trimmedEventId);
+  const totalFeesInr = toNonNegativeNumber(ticketSalesStats?.totalFeesInr ?? ticketSalesStats?.platformFeeInr);
+  const payoutAmountInr = Number(Math.max(0, generatedRevenueInr - totalVendorCostInr - totalFeesInr).toFixed(2));
+  const payoutAmountPaise = Math.round(payoutAmountInr * 100);
+
+  if (payoutAmountPaise <= 0) {
+    throw createApiError(409, 'Generated revenue payout amount must be greater than zero');
+  }
+
+  let payoutRecord = null;
+  if (normalizedMode === 'RAZORPAY') {
+    if (!ownerAuthId) {
+      throw createApiError(409, 'Cannot release payout because event owner authId is missing');
+    }
+
+    try {
+      const payoutRes = await axios.post(
+        `${orderServiceUrl}/orders/user-payouts/release`,
+        {
+          eventId: trimmedEventId,
+          userAuthId: ownerAuthId,
+          payoutAmountPaise,
+          generatedRevenuePaise: Math.round(generatedRevenueInr * 100),
+          totalVendorCostPaise: Math.round(totalVendorCostInr * 100),
+          totalFeesPaise: Math.round(totalFeesInr * 100),
+          currency: 'INR',
+        },
+        {
+          timeout: upstreamTimeoutMs,
+          headers: buildInternalOrderServiceHeaders(),
+        }
+      );
+
+      payoutRecord = payoutRes?.data?.data?.payout || null;
+    } catch (error) {
+      const statusCode = Number(error?.response?.status || error?.statusCode || 502);
+      const message = String(error?.response?.data?.message || error?.message || 'Failed to release payout in Razorpay mode');
+      throw createApiError(statusCode, message);
+    }
+  }
+
+  const paidAt = normalizedMode === 'RAZORPAY'
+    ? (payoutRecord?.paidAt ? new Date(payoutRecord.paidAt) : new Date())
+    : new Date();
+
+  const transactionRef = normalizedMode === 'RAZORPAY'
+    ? String(payoutRecord?.razorpayTransferId || payoutRecord?.payoutId || `RAZORPAY-GRP-${trimmedEventId}-${Date.now()}`).trim()
+    : `DEMO-GRP-${trimmedEventId}-${Date.now()}`;
+
+  planning.generatedRevenuePayout = {
+    mode: normalizedMode,
+    status: 'SUCCESS',
+    amountPaise: payoutAmountPaise,
+    currency: 'INR',
+    paidAt,
+    paidByAuthId: String(actorAuthId || '').trim() || null,
+    transactionRef,
+    notes: normalizedMode === 'RAZORPAY'
+      ? 'Generated revenue payout transferred via Razorpay Route'
+      : 'Generated revenue payout sent to user in DEMO mode',
+  };
+
+  await planning.save({ validateBeforeSave: false });
+
+  if (normalizedMode === 'DEMO' && ownerAuthId) {
+    try {
+      await publishEvent('USER_REVENUE_PAYOUT_SUCCESS', {
+        eventId: trimmedEventId,
+        userAuthId: ownerAuthId,
+        amount: payoutAmountPaise,
+        currency: 'INR',
+        managerAuthId: String(actorAuthId || '').trim() || null,
+        transactionRef,
+        payoutMode: 'DEMO',
+        paidAt: paidAt?.toISOString?.() || new Date().toISOString(),
+      });
+    } catch (kafkaError) {
+      logger.error('Failed to publish USER_REVENUE_PAYOUT_SUCCESS from planning payout:', kafkaError);
+    }
+  }
+
+  const normalizedUpdated = normalizePlanningForApi(planning.toJSON(), cfg.platformFee);
+  normalizedUpdated.ticketSalesStats = ticketSalesStats;
+  normalizedUpdated.generatedRevenuePayoutSummary = {
+    generatedRevenueInr,
+    totalVendorCostInr,
+    totalFeesInr,
+    payoutAmountInr,
+    mode: normalizedMode,
+    alreadyProcessed: false,
+  };
+
+  return normalizedUpdated;
+};
+
+/**
+ * Trigger EMAIL BLAST promotion action for public planning events.
+ */
+const triggerPlanningEmailBlastPromotionAction = async ({ eventId, actorRole, actorAuthId, actorManagerId } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+
+  const normalizedRole = String(actorRole || '').trim().toUpperCase();
+  if (!['MANAGER', 'ADMIN'].includes(normalizedRole)) {
+    throw createApiError(403, 'Only MANAGER or ADMIN can trigger email blast');
+  }
+
+  const planning = await Planning.findOne({ eventId: trimmedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  const category = String(planning.category || '').trim().toLowerCase();
+  if (category !== CATEGORY.PUBLIC) {
+    throw createApiError(409, 'Email blast promotion is supported only for public planning events');
+  }
+
+  if (normalizedRole === 'MANAGER') {
+    const normalizedActorManagerId = String(actorManagerId || '').trim();
+    if (!normalizedActorManagerId) throw createApiError(403, 'Manager identity is required');
+    if (String(planning.assignedManagerId || '').trim() !== normalizedActorManagerId) {
+      throw createApiError(403, 'You are not assigned to this planning');
+    }
+  }
+
+  if (!hasPromotionSelected(planning.promotionType, 'Email Blast')) {
+    throw createApiError(409, 'Email Blast is not selected for this planning event');
+  }
+
+  const requestId = `PEB-${trimmedEventId}-${Date.now()}`;
+  const requestedAt = new Date().toISOString();
+  const eventDate = planning?.schedule?.startAt || planning?.eventDate || null;
+  const parsedEventDate = eventDate ? new Date(eventDate) : null;
+  const eventDateIso = parsedEventDate && !Number.isNaN(parsedEventDate.getTime())
+    ? parsedEventDate.toISOString()
+    : null;
+  const eventLocation = planning?.location?.name || planning?.location || null;
+
+  await publishEvent('PROMOTION_EMAIL_BLAST_REQUESTED', {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'planning',
+    promotionType: 'EMAIL_BLAST',
+    requestedByAuthId: String(actorAuthId || '').trim() || null,
+    requestedByRole: normalizedRole,
+    requestedAt,
+    eventTitle: String(planning?.eventTitle || '').trim() || null,
+    eventDescription: String(planning?.eventDescription || '').trim() || null,
+    eventDate: eventDateIso,
+    eventLocation: eventLocation ? String(eventLocation).trim() : null,
+    eventBannerUrl: String(planning?.eventBanner?.url || planning?.eventBanner || '').trim() || null,
+  });
+
+  return {
+    requestId,
+    eventId: trimmedEventId,
+    eventType: 'planning',
+    promotionType: 'EMAIL_BLAST',
+    requestedAt,
+  };
+};
+
+/**
+ * Submit post-completion feedback for planning event (Owner)
+ */
+const submitPlanningFeedback = async ({ eventId, authId, platformFeedback, vendorFeedback } = {}) => {
+  const trimmedEventId = String(eventId || '').trim();
+  const trimmedAuthId = String(authId || '').trim();
+
+  if (!trimmedEventId) throw createApiError(400, 'eventId is required');
+  if (!trimmedAuthId) throw createApiError(401, 'Authentication required');
+
+  const planning = await Planning.findOne({ eventId: trimmedEventId });
+  if (!planning) throw createApiError(404, 'Planning not found');
+
+  if (String(planning.authId || '').trim() !== trimmedAuthId) {
+    throw createApiError(403, 'Only the event owner can submit feedback');
+  }
+
+  const lifecycleStatus = String(planning.status || '').trim();
+  const canSubmitFeedbackStatus = new Set([
+    STATUS.COMPLETED,
+    STATUS.VENDOR_PAYMENT_PENDING,
+    STATUS.CLOSED,
+  ]);
+  if (!canSubmitFeedbackStatus.has(lifecycleStatus)) {
+    throw createApiError(409, 'Feedback can be submitted only after event completion');
+  }
+
+  if (!planning.remainingPaymentPaid && lifecycleStatus !== STATUS.CLOSED) {
+    throw createApiError(409, 'Feedback can be submitted after the final payment is completed');
+  }
+
+  const existingPlatformRating = Number(planning?.feedback?.platform?.rating || 0);
+  const existingVendorFeedback = Array.isArray(planning?.feedback?.vendors) ? planning.feedback.vendors : [];
+  if ((Number.isFinite(existingPlatformRating) && existingPlatformRating > 0) || existingVendorFeedback.length > 0) {
+    throw createApiError(409, 'Feedback has already been submitted and cannot be updated');
+  }
+
+  const platformRatingRaw = Number(platformFeedback?.rating);
+  const platformRating = Number.isFinite(platformRatingRaw) ? Math.round(platformRatingRaw) : NaN;
+  if (!Number.isFinite(platformRating) || platformRating < 1 || platformRating > 5) {
+    throw createApiError(400, 'platformFeedback.rating must be between 1 and 5');
+  }
+
+  const platformReview = String(platformFeedback?.review || '').trim();
+  if (!platformReview) {
+    throw createApiError(400, 'platformFeedback.review is required');
+  }
+
+  const normalizedPlatformFeedback = {
+    rating: platformRating,
+    review: platformReview,
+    submittedAt: new Date(),
+  };
+
+  const allowedPairs = new Set(
+    (Array.isArray(planning.selectedVendors) ? planning.selectedVendors : [])
+      .map((row) => {
+        const vendorAuthId = String(row?.vendorAuthId || '').trim();
+        const service = String(row?.service || '').trim();
+        if (!vendorAuthId || !service) return null;
+        return `${vendorAuthId.toLowerCase()}::${service.toLowerCase()}`;
+      })
+      .filter(Boolean)
+  );
+
+  if (allowedPairs.size === 0) {
+    throw createApiError(409, 'No opted vendors are available for feedback');
+  }
+
+  const incomingVendorFeedback = Array.isArray(vendorFeedback) ? vendorFeedback : [];
+  if (incomingVendorFeedback.length !== allowedPairs.size) {
+    throw createApiError(400, 'Feedback for every opted vendor is required');
+  }
+
+  const normalizedVendorFeedback = [];
+  const seenPairs = new Set();
+  for (const row of incomingVendorFeedback) {
+    const vendorAuthId = String(row?.vendorAuthId || '').trim();
+    const service = String(row?.service || '').trim();
+    const pairKey = `${vendorAuthId.toLowerCase()}::${service.toLowerCase()}`;
+    if (!vendorAuthId || !service || !allowedPairs.has(pairKey)) {
+      throw createApiError(400, 'vendorFeedback contains vendor/service that is not part of opted vendors');
+    }
+    if (seenPairs.has(pairKey)) {
+      throw createApiError(400, 'Duplicate vendor feedback entries are not allowed');
+    }
+    seenPairs.add(pairKey);
+
+    const ratingRaw = Number(row?.rating);
+    const rating = Number.isFinite(ratingRaw) ? Math.round(ratingRaw) : NaN;
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      throw createApiError(400, 'Each vendor feedback rating must be between 1 and 5');
+    }
+
+    const review = String(row?.review || '').trim();
+    if (!review) {
+      throw createApiError(400, 'Each vendor feedback review is required');
+    }
+
+    normalizedVendorFeedback.push({
+      vendorAuthId,
+      service,
+      rating,
+      review,
+      submittedAt: new Date(),
+    });
+  }
+
+  if (seenPairs.size !== allowedPairs.size) {
+    throw createApiError(400, 'Feedback for every opted vendor is required');
+  }
+
+  planning.feedback = {
+    platform: normalizedPlatformFeedback,
+    vendors: normalizedVendorFeedback,
+  };
+
+  await planning.save({ validateBeforeSave: false });
+
+  const cfg = await promoteConfigService.getFees();
+  return normalizePlanningForApi(planning.toJSON(), cfg.platformFee, 'USER');
 };
 
 /**
@@ -1055,6 +1870,135 @@ const markPlanningVendorConfirmationPaid = async (
 };
 
 /**
+ * Mark private planning remaining payment as paid and move to VENDOR_PAYMENT_PENDING.
+ */
+const markPlanningRemainingPaymentPaid = async (
+  eventId,
+  { amountPaise = null, currency = null, paidAt = null } = {}
+) => {
+  if (!eventId || eventId.trim() === '') {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: eventId.trim() });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  if (String(planning.category || '').trim().toLowerCase() !== CATEGORY.PRIVATE) {
+    throw createApiError(409, 'Remaining payment flow is currently supported only for private planning events');
+  }
+
+  const currentStatus = String(planning.status || '').trim();
+  if (currentStatus !== STATUS.COMPLETED && currentStatus !== STATUS.VENDOR_PAYMENT_PENDING) {
+    throw createApiError(409, 'Remaining payment can only be completed after event status is COMPLETED');
+  }
+
+  const nextAmount = amountPaise != null ? Number(amountPaise) : null;
+  const nextCurrency = currency != null ? String(currency).trim() : null;
+  const nextPaidAt = paidAt ? new Date(paidAt) : null;
+
+  planning.remainingPaymentPaid = true;
+
+  if (nextAmount != null && Number.isFinite(nextAmount) && nextAmount >= 0) {
+    planning.remainingPaymentPaidAmountPaise = Math.round(nextAmount);
+  }
+  if (nextCurrency) {
+    planning.remainingPaymentPaidCurrency = nextCurrency;
+  }
+  if (nextPaidAt && !Number.isNaN(nextPaidAt.getTime())) {
+    planning.remainingPaymentPaidAt = nextPaidAt;
+  }
+
+  if (currentStatus !== STATUS.VENDOR_PAYMENT_PENDING) {
+    planning.status = STATUS.VENDOR_PAYMENT_PENDING;
+  }
+
+  await planning.save({ validateBeforeSave: false });
+  logger.info(`Planning remaining payment marked as paid: ${eventId} -> ${planning.status}`);
+
+  return planning;
+};
+
+/**
+ * Sync planning payment completion status from vendor payout records.
+ * - If all accepted+locked vendor services are paid: CLOSED
+ * - If partially paid while confirmed: VENDOR_PAYMENT_PENDING
+ */
+const syncPlanningStatusAfterVendorPayout = async (eventId) => {
+  const normalizedEventId = String(eventId || '').trim();
+  if (!normalizedEventId) {
+    throw createApiError(400, 'Event ID is required');
+  }
+
+  const planning = await Planning.findOne({ eventId: normalizedEventId });
+  if (!planning) {
+    throw createApiError(404, 'Planning not found');
+  }
+
+  const selection = await VendorSelection.findOne({ eventId: normalizedEventId })
+    .select('vendors')
+    .lean();
+
+  const vendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  const requiredPayoutKeys = vendors
+    .filter((row) => String(row?.status || '').trim().toUpperCase() === 'ACCEPTED')
+    .filter((row) => Boolean(row?.priceLocked))
+    .map((row) => toVendorServicePayoutKey({ vendorAuthId: row?.vendorAuthId, service: row?.service }))
+    .filter(Boolean);
+
+  if (requiredPayoutKeys.length === 0) {
+    return planning;
+  }
+
+  let eventPayoutRows = [];
+  try {
+    eventPayoutRows = await fetchVendorPayoutsForEventFromOrderService(normalizedEventId);
+  } catch (error) {
+    logger.warn('Failed to sync planning payout status from order-service', {
+      eventId: normalizedEventId,
+      message: error?.message || String(error),
+    });
+    return planning;
+  }
+
+  const successfulPayoutKeys = new Set(
+    (Array.isArray(eventPayoutRows) ? eventPayoutRows : [])
+      .filter((row) => String(row?.status || '').trim().toUpperCase() === 'SUCCESS')
+      .map((row) => toVendorServicePayoutKey({ vendorAuthId: row?.vendorAuthId, service: row?.service }))
+      .filter(Boolean)
+  );
+
+  const allVendorsPaid = requiredPayoutKeys.every((key) => successfulPayoutKeys.has(key));
+  const currentStatus = String(planning.status || '').trim();
+
+  if (allVendorsPaid) {
+    if (currentStatus !== STATUS.CLOSED || !planning.fullPaymentPaid) {
+      planning.status = STATUS.CLOSED;
+      planning.fullPaymentPaid = true;
+      await planning.save({ validateBeforeSave: false });
+      logger.info('Planning moved to CLOSED after all vendor payouts completed', {
+        eventId: normalizedEventId,
+        requiredPayoutCount: requiredPayoutKeys.length,
+      });
+    }
+    return planning;
+  }
+
+  if (currentStatus === STATUS.CONFIRMED) {
+    planning.status = STATUS.VENDOR_PAYMENT_PENDING;
+    await planning.save({ validateBeforeSave: false });
+    logger.info('Planning moved to VENDOR_PAYMENT_PENDING after partial vendor payouts', {
+      eventId: normalizedEventId,
+      requiredPayoutCount: requiredPayoutKeys.length,
+      successfulPayoutCount: successfulPayoutKeys.size,
+    });
+  }
+
+  return planning;
+};
+
+/**
  * Confirm a planning selection (Owner)
  * - Sets planning.status to PENDING_APPROVAL
  * - Ensures VendorSelection exists and snapshots selected vendors onto planning.selectedVendors
@@ -1128,7 +2072,7 @@ const getAdminDashboard = async ({ limit = 200 } = {}) => {
       .lean(),
     Planning.find({
       assignedManagerId: null,
-      status: { $nin: [STATUS.COMPLETED, STATUS.REJECTED] },
+      status: { $nin: TERMINAL_STATUSES },
       ...progressedGate,
     })
       .sort({ createdAt: -1 })
@@ -1161,6 +2105,7 @@ module.exports = {
   getPlanningByEventId,
   getAllPlannings,
   updatePlanningStatus,
+  markPlanningAsComplete,
   assignPlanningManager,
   tryAutoAssignPlanningManager,
   unassignPlanningManager,
@@ -1169,6 +2114,8 @@ module.exports = {
   markPlanningPaid,
   markPlanningDepositPaid,
   markPlanningVendorConfirmationPaid,
+  markPlanningRemainingPaymentPaid,
+  syncPlanningStatusAfterVendorPayout,
   confirmPlanning,
   getAdminDashboard,
   getPlanningsForManager,
@@ -1177,4 +2124,7 @@ module.exports = {
   updatePlanningReservationDayForOwner,
   addPlanningCoreStaff,
   removePlanningCoreStaff,
+  releasePlanningGeneratedRevenuePayout,
+  triggerPlanningEmailBlastPromotionAction,
+  submitPlanningFeedback,
 };

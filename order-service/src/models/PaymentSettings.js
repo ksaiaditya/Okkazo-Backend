@@ -8,6 +8,13 @@ const PaymentSettingsSchema = new mongoose.Schema(
       max: 100,
       default: 25,
     },
+    vendorPayoutMode: {
+      type: String,
+      enum: ['DEMO', 'RAZORPAY'],
+      default: 'DEMO',
+      trim: true,
+      uppercase: true,
+    },
   },
   {
     timestamps: true,

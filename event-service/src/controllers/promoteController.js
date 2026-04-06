@@ -4,6 +4,24 @@ const bannerUploadService = require('../services/bannerUploadService');
 const { publishEvent } = require('../kafka/eventProducer');
 const logger = require('../utils/logger');
 const promoteConfigService = require('../services/promoteConfigService');
+const PROMOTE_LIFECYCLE_STATUSES = new Set(['CONFIRMED', 'LIVE', 'COMPLETE', 'COMPLETED', 'CLOSED']);
+
+const publishPromoteLifecycleEventIfNeeded = async ({ promote, updatedBy = null }) => {
+  const status = String(promote?.eventStatus || '').trim().toUpperCase();
+  if (!PROMOTE_LIFECYCLE_STATUSES.has(status)) return;
+
+  await publishEvent('EVENT_LIFECYCLE_STATUS_UPDATED', {
+    eventId: String(promote?.eventId || '').trim() || null,
+    authId: String(promote?.authId || '').trim() || null,
+    status,
+    eventType: 'promote',
+    assignedManagerId: String(promote?.assignedManagerId || '').trim() || null,
+    vendorAuthIds: [],
+    eventTitle: String(promote?.eventTitle || '').trim() || null,
+    updatedBy: updatedBy ? String(updatedBy).trim() : null,
+    occurredAt: new Date().toISOString(),
+  });
+};
 
 const buildManagerProfile = (user) => {
   if (!user || typeof user !== 'object') return null;
@@ -348,6 +366,67 @@ const removePromoteCoreStaff = async (req, res) => {
   }
 };
 
+/**
+ * Release generated revenue payout to user for promote event (Manager/Admin)
+ * PATCH /promote/:eventId/generated-revenue-payout
+ */
+const releasePromoteGeneratedRevenuePayout = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const updated = await promoteService.releasePromoteGeneratedRevenuePayout({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+      mode: req.body?.mode || 'DEMO',
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: updated?.generatedRevenuePayoutSummary?.alreadyProcessed
+        ? 'Generated revenue payout already sent to user'
+        : 'Generated revenue payout sent to user',
+      data: updated,
+    });
+  } catch (error) {
+    logger.error('Error in releasePromoteGeneratedRevenuePayout:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to release generated revenue payout',
+    });
+  }
+};
+
+/**
+ * Trigger EMAIL BLAST promotion action (Manager/Admin)
+ * POST /promote/:eventId/promotion-actions/email-blast
+ */
+const triggerPromoteEmailBlastPromotionAction = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    const result = await promoteService.triggerPromoteEmailBlastPromotionAction({
+      eventId,
+      actorRole: req.user?.role,
+      actorAuthId: req.user?.authId,
+      actorManagerId: req.user?.role === 'ADMIN' ? null : await resolveUserServiceIdFromAuthId(req.user?.authId),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Email blast request submitted successfully',
+      data: result,
+    });
+  } catch (error) {
+    logger.error('Error in triggerPromoteEmailBlastPromotionAction:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to trigger email blast',
+    });
+  }
+};
+
 // ─── Update promote status (manager / admin) ──────────────────────────────────
 /**
  * PATCH /promote/:eventId/status
@@ -369,7 +448,14 @@ const updatePromoteStatus = async (req, res) => {
         eventId: promote.eventId,
         authId: promote.authId,
         eventStatus: promote.eventStatus,
+        assignedManagerId: promote.assignedManagerId,
+        eventTitle: promote.eventTitle,
         updatedBy: req.user.authId,
+      });
+
+      await publishPromoteLifecycleEventIfNeeded({
+        promote,
+        updatedBy: req.user?.authId || null,
       });
     } catch (kafkaError) {
       logger.error('Failed to publish PROMOTE_STATUS_UPDATED:', kafkaError.message);
@@ -425,6 +511,13 @@ const unassignManager = async (req, res) => {
         eventId: promote.eventId,
         authId: promote.authId,
         eventStatus: promote.eventStatus,
+        assignedManagerId: promote.assignedManagerId,
+        eventTitle: promote.eventTitle,
+        updatedBy: req.user?.authId || null,
+      });
+
+      await publishPromoteLifecycleEventIfNeeded({
+        promote,
         updatedBy: req.user?.authId || null,
       });
     } catch (kafkaError) {
@@ -571,6 +664,8 @@ module.exports = {
   updatePromoteDetails,
   addPromoteCoreStaff,
   removePromoteCoreStaff,
+  releasePromoteGeneratedRevenuePayout,
+  triggerPromoteEmailBlastPromotionAction,
   getAllPromotes,
   getManagerPromoteEvents,
   updatePromoteStatus,
