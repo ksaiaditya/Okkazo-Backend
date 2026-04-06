@@ -26,6 +26,21 @@ const sentAlternativesEmails = new Map();
 const quoteDedupeTtlMs = parseInt(process.env.QUOTE_EMAIL_DEDUPE_TTL_MS || '86400000', 10);
 const sentQuoteEmails = new Map();
 
+const settlementDedupeTtlMs = parseInt(process.env.SETTLEMENT_EMAIL_DEDUPE_TTL_MS || '86400000', 10);
+const sentSettlementEmails = new Map();
+
+const userRevenuePayoutEmailDedupeTtlMs = parseInt(
+  process.env.USER_REVENUE_PAYOUT_EMAIL_DEDUPE_TTL_MS || String(dedupeTtlMs),
+  10
+);
+const sentUserRevenuePayoutEmails = new Map();
+
+const promotionEmailBlastDedupeTtlMs = parseInt(
+  process.env.PROMOTION_EMAIL_BLAST_DEDUPE_TTL_MS || '900000',
+  10
+);
+const sentPromotionEmailBlastRequests = new Map();
+
 const pruneSentCache = () => {
   const now = Date.now();
   for (const [key, ts] of sentPaymentEmails.entries()) {
@@ -53,6 +68,33 @@ const pruneQuoteSentCache = () => {
   }
 };
 
+const pruneSettlementSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentSettlementEmails.entries()) {
+    if (now - ts > settlementDedupeTtlMs) {
+      sentSettlementEmails.delete(key);
+    }
+  }
+};
+
+const pruneUserRevenuePayoutSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentUserRevenuePayoutEmails.entries()) {
+    if (now - ts > userRevenuePayoutEmailDedupeTtlMs) {
+      sentUserRevenuePayoutEmails.delete(key);
+    }
+  }
+};
+
+const prunePromotionEmailBlastSentCache = () => {
+  const now = Date.now();
+  for (const [key, ts] of sentPromotionEmailBlastRequests.entries()) {
+    if (now - ts > promotionEmailBlastDedupeTtlMs) {
+      sentPromotionEmailBlastRequests.delete(key);
+    }
+  }
+};
+
 const formatMoneyRangeFromPaise = (minPaise, maxPaise) => {
   const min = Number(minPaise);
   const max = Number(maxPaise);
@@ -69,6 +111,14 @@ const formatMoneyFromPaise = (paise) => {
   const inr = Math.round(n) / 100;
   return `₹${inr.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 };
+
+const buildSystemHeaders = () => ({
+  'x-auth-id': 'email-service',
+  'x-user-id': 'email-service',
+  'x-user-email': process.env.FROM_EMAIL || 'noreply@okkazo.com',
+  'x-user-username': 'email-service',
+  'x-user-role': 'ADMIN',
+});
 
 const fetchPlanningQuoteLatestForUser = async (eventId, user) => {
   const response = await axios.get(`${eventServiceUrl}/planning/${encodeURIComponent(eventId)}/quote/latest`, {
@@ -104,7 +154,11 @@ const fetchVendorSelectionForUser = async (eventId, user) => {
 };
 
 const handlePlanningQuoteLocked = async (event) => {
-  const { eventId, authId, version } = event || {};
+  const { eventId, authId, version, forceSend, emailAudience } = event || {};
+  const normalizedAudience = String(emailAudience || '').trim().toUpperCase();
+  const sendUserEmail = normalizedAudience !== 'VENDOR_ONLY';
+  const sendVendorEmail = normalizedAudience !== 'USER_ONLY';
+  const bypassDedupe = Boolean(forceSend);
 
   if (!eventId || !authId) {
     logger.error('PLANNING_QUOTE_LOCKED missing required fields', { event });
@@ -114,27 +168,33 @@ const handlePlanningQuoteLocked = async (event) => {
   pruneQuoteSentCache();
 
   const userDedupeKey = `${String(eventId)}:${String(version || 'latest')}:USER`;
-  if (sentQuoteEmails.has(userDedupeKey)) {
+  if (sendUserEmail && !bypassDedupe && sentQuoteEmails.has(userDedupeKey)) {
     logger.info('Skipping duplicate quote email (user)', { eventId, version, userDedupeKey });
     return;
   }
 
   const owner = await fetchUserByAuthId(authId);
-  if (!owner?.email) {
+  if (sendUserEmail && !owner?.email) {
     logger.error('Unable to send quote email: owner email not found', { authId, eventId });
     return;
   }
 
+  const requestUser = {
+    ...owner,
+    authId: String(authId || '').trim(),
+    role: owner?.role || 'USER',
+  };
+
   let planning = null;
   try {
-    planning = await fetchPlanningByEventIdForUser(eventId, { ...owner, role: owner?.role || 'USER' });
+    planning = await fetchPlanningByEventIdForUser(eventId, requestUser);
   } catch (e) {
     logger.warn('Failed to fetch planning for quote email (non-blocking)', { eventId, authId, message: e?.message || String(e) });
   }
 
   let quote = null;
   try {
-    quote = await fetchPlanningQuoteLatestForUser(eventId, { ...owner, role: owner?.role || 'USER' });
+    quote = await fetchPlanningQuoteLatestForUser(eventId, requestUser);
   } catch (e) {
     logger.error('Failed to fetch quote for PLANNING_QUOTE_LOCKED', { eventId, authId, message: e?.message || String(e) });
     return;
@@ -142,7 +202,7 @@ const handlePlanningQuoteLocked = async (event) => {
 
   let selection = null;
   try {
-    selection = await fetchVendorSelectionForUser(eventId, { ...owner, role: owner?.role || 'USER' });
+    selection = await fetchVendorSelectionForUser(eventId, requestUser);
   } catch (e) {
     logger.warn('Failed to fetch vendor selection for quote email (non-blocking)', {
       eventId,
@@ -177,6 +237,7 @@ const handlePlanningQuoteLocked = async (event) => {
   }
 
   const selectionMetaByVendorService = new Map();
+  const selectionPricingByVendorService = new Map();
   const selectionVendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
   for (const row of selectionVendors) {
     const vendorAuthId = String(row?.vendorAuthId || '').trim();
@@ -206,6 +267,18 @@ const handlePlanningQuoteLocked = async (event) => {
       quantity,
       businessName: businessName || null,
     });
+
+    const quotedInrRaw = Number(row?.vendorQuotedPrice);
+    const quotedInr = Number.isFinite(quotedInrRaw) && quotedInrRaw > 0 ? quotedInrRaw : 0;
+    const isLocked = Boolean(row?.priceLocked) && quotedInr > 0;
+    const lockedTotalPaise = isLocked
+      ? Math.max(0, Math.round(quotedInr * 100))
+      : 0;
+
+    selectionPricingByVendorService.set(key, {
+      isLocked,
+      lockedTotalPaise,
+    });
   }
 
   const vendorCache = new Map();
@@ -229,18 +302,27 @@ const handlePlanningQuoteLocked = async (event) => {
 
   const quoteItems = Array.isArray(quote?.items) ? quote.items : [];
   const userItems = [];
+  let userItemsTotalPaise = 0;
   for (const it of quoteItems) {
     const vendorAuthId = String(it?.vendorAuthId || '').trim();
     const metaKey = toItemLookupKey(vendorAuthId, it?.service);
     const selectionMeta = metaKey ? selectionMetaByVendorService.get(metaKey) : null;
+    const selectionPricing = metaKey ? selectionPricingByVendorService.get(metaKey) : null;
     const vendorName = selectionMeta?.businessName || await resolveVendorName(vendorAuthId);
-    const itemTotalPaise = Number(
-      it?.vendorTotal?.minPaise ??
-      it?.vendorTotal?.maxPaise ??
+    const fallbackClientTotalPaise = Number(
       it?.clientTotal?.minPaise ??
       it?.clientTotal?.maxPaise ??
+      it?.vendorTotal?.minPaise ??
+      it?.vendorTotal?.maxPaise ??
       0
     );
+    const itemTotalPaise = (selectionPricing?.isLocked && Number(selectionPricing?.lockedTotalPaise) > 0)
+      ? Number(selectionPricing.lockedTotalPaise)
+      : fallbackClientTotalPaise;
+
+    if (Number.isFinite(itemTotalPaise) && itemTotalPaise > 0) {
+      userItemsTotalPaise += itemTotalPaise;
+    }
 
     userItems.push({
       service: selectionMeta?.serviceName || it?.service || 'Service',
@@ -262,26 +344,32 @@ const handlePlanningQuoteLocked = async (event) => {
     ? formatMoneyFromPaise(promotionsTotalPaise)
     : null;
 
-  const vendorSubtotalPaise = Number(quote?.vendorSubtotal?.minPaise ?? quote?.vendorSubtotal?.maxPaise ?? 0);
-  const totalAmountPaise = (vendorSubtotalPaise > 0 || promotionsTotalPaise > 0)
-    ? Math.max(0, vendorSubtotalPaise) + Math.max(0, promotionsTotalPaise)
-    : Number(quote?.clientGrandTotal?.minPaise ?? quote?.clientGrandTotal?.maxPaise ?? 0);
+  const snapshotClientTotalPaise = Number(quote?.clientGrandTotal?.minPaise ?? quote?.clientGrandTotal?.maxPaise ?? 0);
+  const totalAmountPaise = userItemsTotalPaise > 0
+    ? Math.max(0, userItemsTotalPaise) + Math.max(0, promotionsTotalPaise)
+    : snapshotClientTotalPaise;
   const totalAmount = formatMoneyFromPaise(totalAmountPaise);
 
-  await emailService.sendPlanningQuoteLockedUserEmail(owner.email, {
-    recipientName: owner?.name || owner?.username || 'there',
-    eventId,
-    eventTitle,
-    eventDate,
-    eventLocation,
-    version: quote?.version || version || 1,
-    items: userItems,
-    promotions,
-    promotionsTotal,
-    totalAmount,
-  });
+  if (sendUserEmail) {
+    await emailService.sendPlanningQuoteLockedUserEmail(owner.email, {
+      recipientName: owner?.name || owner?.username || 'there',
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      version: quote?.version || version || 1,
+      items: userItems,
+      promotions,
+      promotionsTotal,
+      totalAmount,
+    });
 
-  sentQuoteEmails.set(userDedupeKey, Date.now());
+    sentQuoteEmails.set(userDedupeKey, Date.now());
+  }
+
+  if (!sendVendorEmail) {
+    return;
+  }
 
   // Vendor emails (per vendorAuthId)
   const items = quoteItems;
@@ -296,7 +384,7 @@ const handlePlanningQuoteLocked = async (event) => {
   for (const [vendorAuthId, vendorItemsRaw] of byVendor.entries()) {
     const vendorDedupeKey = `${String(eventId)}:${String(quote?.version || version || 'latest')}:VENDOR:${vendorAuthId}`;
     pruneQuoteSentCache();
-    if (sentQuoteEmails.has(vendorDedupeKey)) {
+    if (!bypassDedupe && sentQuoteEmails.has(vendorDedupeKey)) {
       logger.info('Skipping duplicate quote email (vendor)', { eventId, version, vendorAuthId });
       continue;
     }
@@ -354,6 +442,189 @@ const handlePlanningQuoteLocked = async (event) => {
 
     sentQuoteEmails.set(vendorDedupeKey, Date.now());
   }
+};
+
+const handlePlanningRemainingPaymentConfirmed = async (event) => {
+  const { eventId, authId, razorpayPaymentId, paymentOrderId, paidAt } = event || {};
+  if (!eventId || !authId) {
+    logger.error('PLANNING_REMAINING_PAYMENT_CONFIRMED missing required fields', { event });
+    return;
+  }
+
+  pruneSettlementSentCache();
+  const dedupeKey = `${String(eventId)}:${String(razorpayPaymentId || paymentOrderId || paidAt || 'remaining-payment')}`;
+  if (sentSettlementEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate settlement thank-you email', { eventId, dedupeKey });
+    return;
+  }
+
+  const owner = await fetchUserByAuthId(authId);
+  if (!owner?.email) {
+    logger.error('Unable to send settlement thank-you email: user email not found', { authId, eventId });
+    return;
+  }
+
+  const requestUser = {
+    ...owner,
+    authId: String(authId || '').trim(),
+    role: owner?.role || 'USER',
+  };
+
+  const planning = await fetchPlanningByEventIdForUser(eventId, requestUser);
+  if (!planning) {
+    logger.error('Unable to send settlement thank-you email: planning not found', { authId, eventId });
+    return;
+  }
+
+  let quote = null;
+  try {
+    quote = await fetchPlanningQuoteLatestForUser(eventId, requestUser);
+  } catch (e) {
+    logger.warn('Failed to fetch latest quote for settlement thank-you email', {
+      eventId,
+      authId,
+      message: e?.message || String(e),
+    });
+  }
+
+  let selection = null;
+  try {
+    selection = await fetchVendorSelectionForUser(eventId, requestUser);
+  } catch (e) {
+    logger.warn('Failed to fetch vendor selection for settlement thank-you email', {
+      eventId,
+      authId,
+      message: e?.message || String(e),
+    });
+  }
+
+  const normalizeLookup = (value) => String(value || '').trim().toLowerCase();
+  const toItemLookupKey = (vendorAuthId, service) => {
+    const vendorKey = normalizeLookup(vendorAuthId);
+    const serviceKey = normalizeLookup(service);
+    if (!vendorKey || !serviceKey) return null;
+    return `${vendorKey}::${serviceKey}`;
+  };
+
+  const vendorProfiles = Array.isArray(selection?.vendorProfiles) ? selection.vendorProfiles : [];
+  const vendorProfileByAuthId = new Map();
+  for (const profile of vendorProfiles) {
+    const authKeys = [profile?.authId, profile?.vendorAuthId, profile?.userAuthId]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean);
+    for (const authKey of authKeys) {
+      if (!vendorProfileByAuthId.has(authKey)) {
+        vendorProfileByAuthId.set(authKey, profile);
+      }
+    }
+  }
+
+  const selectionMetaByVendorService = new Map();
+  const selectionPricingByVendorService = new Map();
+  const selectionVendors = Array.isArray(selection?.vendors) ? selection.vendors : [];
+  for (const row of selectionVendors) {
+    const vendorAuthId = String(row?.vendorAuthId || '').trim();
+    const key = toItemLookupKey(vendorAuthId, row?.service);
+    if (!key) continue;
+
+    const profile = vendorProfileByAuthId.get(vendorAuthId) || null;
+    const businessName = String(
+      profile?.businessName ||
+      profile?.name ||
+      row?.businessName ||
+      ''
+    ).trim();
+
+    selectionMetaByVendorService.set(key, {
+      serviceName: String(row?.serviceName || row?.service || '').trim() || null,
+      businessName: businessName || null,
+    });
+
+    const quotedInrRaw = Number(row?.vendorQuotedPrice);
+    const quotedInr = Number.isFinite(quotedInrRaw) && quotedInrRaw > 0 ? quotedInrRaw : 0;
+    const isLocked = Boolean(row?.priceLocked) && quotedInr > 0;
+    const lockedTotalPaise = isLocked
+      ? Math.max(0, Math.round(quotedInr * 100))
+      : 0;
+
+    selectionPricingByVendorService.set(key, {
+      isLocked,
+      lockedTotalPaise,
+    });
+  }
+
+  const quoteItems = Array.isArray(quote?.items) ? quote.items : [];
+  const items = [];
+  let itemsTotalPaise = 0;
+  for (const it of quoteItems) {
+    const vendorAuthId = String(it?.vendorAuthId || '').trim();
+    const key = toItemLookupKey(vendorAuthId, it?.service);
+    const selectionMeta = key ? selectionMetaByVendorService.get(key) : null;
+    const selectionPricing = key ? selectionPricingByVendorService.get(key) : null;
+
+    const fallbackClientTotalPaise = Number(
+      it?.clientTotal?.minPaise ??
+      it?.clientTotal?.maxPaise ??
+      it?.vendorTotal?.minPaise ??
+      it?.vendorTotal?.maxPaise ??
+      0
+    );
+    const itemTotalPaise = (selectionPricing?.isLocked && Number(selectionPricing?.lockedTotalPaise) > 0)
+      ? Number(selectionPricing.lockedTotalPaise)
+      : fallbackClientTotalPaise;
+
+    itemsTotalPaise += Number.isFinite(itemTotalPaise) && itemTotalPaise > 0 ? itemTotalPaise : 0;
+
+    items.push({
+      service: selectionMeta?.serviceName || it?.service || 'Service',
+      vendorName: selectionMeta?.businessName || 'Vendor',
+      amount: formatMoneyFromPaise(itemTotalPaise),
+    });
+  }
+
+  const promotions = (Array.isArray(quote?.promotions) ? quote.promotions : [])
+    .map((p) => ({
+      name: String(p?.value || '').trim() || 'Promotion',
+      amount: formatMoneyFromPaise(p?.feePaise),
+    }))
+    .filter((p) => p.name);
+
+  const promotionsTotalPaise = Number(quote?.promotionsTotal?.minPaise ?? quote?.promotionsTotal?.maxPaise ?? 0);
+  const totalAmountPaise = Number(quote?.clientGrandTotal?.minPaise ?? quote?.clientGrandTotal?.maxPaise ?? 0)
+    || Math.max(0, itemsTotalPaise + Math.max(0, promotionsTotalPaise));
+
+  const depositPaidAmountPaise = Math.max(0, Number(planning?.depositPaidAmountPaise || 0));
+  const vendorConfirmationPaidAmountPaise = Math.max(0, Number(planning?.vendorConfirmationPaidAmountPaise || 0));
+  const remainingPaymentPaidAmountPaise = Math.max(0, Number(planning?.remainingPaymentPaidAmountPaise || 0));
+  const totalPaidPaise = depositPaidAmountPaise + vendorConfirmationPaidAmountPaise + remainingPaymentPaidAmountPaise;
+
+  const frontendBaseUrl = String(process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  const feedbackUrl = frontendBaseUrl
+    ? `${frontendBaseUrl}/user/event-management/${encodeURIComponent(String(eventId))}`
+    : null;
+
+  await emailService.sendPlanningFinalSettlementThankYouEmail(owner.email, {
+    recipientName: owner?.name || owner?.username || 'there',
+    eventId,
+    eventTitle: planning?.eventTitle || 'Event',
+    eventDate: planning?.eventDate || planning?.schedule?.startAt || null,
+    eventLocation: planning?.location?.name || planning?.location?.location || null,
+    items,
+    promotions,
+    totalAmount: formatMoneyFromPaise(totalAmountPaise || totalPaidPaise),
+    depositPaid: formatMoneyFromPaise(depositPaidAmountPaise),
+    vendorConfirmationPaid: formatMoneyFromPaise(vendorConfirmationPaidAmountPaise),
+    remainingPaid: formatMoneyFromPaise(remainingPaymentPaidAmountPaise),
+    totalPaid: formatMoneyFromPaise(totalPaidPaise),
+    feedbackUrl,
+  });
+
+  sentSettlementEmails.set(dedupeKey, Date.now());
+  logger.info('Planning final settlement thank-you email sent successfully', {
+    eventId,
+    authId,
+    to: owner.email,
+  });
 };
 
 const initialize = async () => {
@@ -489,6 +760,35 @@ const fetchUserByAuthId = async (authId) => {
   }
 };
 
+const fetchUsersByRole = async ({ role = 'USER', pageSize = 100 } = {}) => {
+  const users = [];
+  const maxPages = 200;
+  const normalizedRole = String(role || 'USER').trim().toUpperCase();
+  const safePageSize = Math.max(1, Math.min(100, Number(pageSize) || 100));
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const response = await axios.get(`${userServiceUrl}/`, {
+      timeout: httpTimeoutMs,
+      headers: buildSystemHeaders(),
+      params: {
+        role: normalizedRole,
+        page,
+        limit: safePageSize,
+      },
+    });
+
+    const rows = Array.isArray(response?.data?.data) ? response.data.data : [];
+    users.push(...rows);
+
+    const totalPagesRaw = Number(response?.data?.pagination?.totalPages || page);
+    const totalPages = Number.isFinite(totalPagesRaw) && totalPagesRaw > 0 ? totalPagesRaw : page;
+
+    if (rows.length === 0 || page >= totalPages) break;
+  }
+
+  return users;
+};
+
 const fetchPlanningByEventIdForUser = async (eventId, user) => {
   const response = await axios.get(`${eventServiceUrl}/planning/${encodeURIComponent(eventId)}`, {
     timeout: httpTimeoutMs,
@@ -538,6 +838,15 @@ const handlePaymentSuccessEvent = async (payload) => {
   const { eventId, authId, razorpayPaymentId, transactionId, paidAt, amount, currency, orderType } = payload || {};
   const normalizedOrderType = String(orderType || '').trim().toUpperCase();
   const notes = payload?.notes || {};
+
+  if (normalizedOrderType === 'PLANNING EVENT REMAINING FEE') {
+    logger.info('Skipping generic payment-success email for remaining fee payment', {
+      eventId,
+      authId,
+      orderType: normalizedOrderType,
+    });
+    return;
+  }
 
   if (!eventId || !authId) {
     logger.error('PAYMENT_SUCCESS event missing required fields', { eventId, authId });
@@ -658,6 +967,232 @@ const handlePaymentSuccessEvent = async (payload) => {
   logger.info('Payment success email sent successfully', { authId, eventId, to: recipientEmail });
 };
 
+const handleUserRevenuePayoutSuccessEvent = async (payload) => {
+  const eventId = String(payload?.eventId || '').trim();
+  const userAuthId = String(payload?.userAuthId || payload?.authId || '').trim();
+  const payoutAmountPaiseRaw = Number(payload?.amount ?? payload?.payoutAmountPaise ?? 0);
+  const payoutAmountPaise = Number.isFinite(payoutAmountPaiseRaw) && payoutAmountPaiseRaw > 0
+    ? Math.round(payoutAmountPaiseRaw)
+    : 0;
+
+  if (!eventId || !userAuthId || payoutAmountPaise <= 0) {
+    logger.error('USER_REVENUE_PAYOUT_SUCCESS missing required fields', {
+      eventId,
+      userAuthId,
+      payoutAmountPaise,
+    });
+    return;
+  }
+
+  pruneUserRevenuePayoutSentCache();
+  const dedupeKey = String(
+    payload?.payoutId
+    || payload?.razorpayTransferId
+    || payload?.transactionRef
+    || `${eventId}:${userAuthId}:${payload?.paidAt || payoutAmountPaise}`
+  ).trim();
+  if (sentUserRevenuePayoutEmails.has(dedupeKey)) {
+    logger.info('Skipping duplicate user revenue payout email', { eventId, userAuthId, dedupeKey });
+    return;
+  }
+
+  const user = await fetchUserByAuthId(userAuthId);
+  const recipientEmail = user?.email;
+  if (!recipientEmail) {
+    logger.error('Unable to send generated revenue payout email: user email not found', { userAuthId, eventId });
+    return;
+  }
+
+  const requestUser = {
+    ...user,
+    authId: userAuthId,
+    role: user?.role || 'USER',
+  };
+
+  let eventTitle = 'Event';
+  let eventLocation = 'TBA';
+
+  try {
+    const promote = await fetchPromoteByEventIdForUser(eventId, requestUser);
+    if (promote) {
+      eventTitle = promote?.eventTitle || eventTitle;
+      eventLocation = promote?.venue?.locationName || eventLocation;
+    }
+  } catch (error) {
+    if (Number(error?.response?.status) !== 404) {
+      logger.warn('Unable to fetch promote details for payout email', {
+        eventId,
+        userAuthId,
+        message: error?.message || String(error),
+      });
+    }
+  }
+
+  if (eventTitle === 'Event') {
+    try {
+      const planning = await fetchPlanningByEventIdForUser(eventId, requestUser);
+      if (planning) {
+        eventTitle = planning?.eventTitle || eventTitle;
+        eventLocation = planning?.location?.name || planning?.location || eventLocation;
+      }
+    } catch (error) {
+      if (Number(error?.response?.status) !== 404) {
+        logger.warn('Unable to fetch planning details for payout email', {
+          eventId,
+          userAuthId,
+          message: error?.message || String(error),
+        });
+      }
+    }
+  }
+
+  await emailService.sendUserGeneratedRevenueReceivedEmail(recipientEmail, {
+    recipientName: user?.name || user?.username || 'there',
+    eventId,
+    eventTitle,
+    eventLocation,
+    payoutAmountPaise,
+    currency: payload?.currency || 'INR',
+    payoutMode: payload?.payoutMode || null,
+    paidAt: payload?.paidAt || null,
+    transactionRef: payload?.razorpayTransferId || payload?.transactionRef || payload?.payoutId || null,
+  });
+
+  sentUserRevenuePayoutEmails.set(dedupeKey, Date.now());
+  logger.info('Generated revenue payout email sent successfully', {
+    eventId,
+    userAuthId,
+    to: recipientEmail,
+    dedupeKey,
+  });
+};
+
+const handlePromotionEmailBlastRequested = async (payload) => {
+  const eventId = String(payload?.eventId || '').trim();
+  if (!eventId) {
+    logger.error('PROMOTION_EMAIL_BLAST_REQUESTED missing eventId', { payload });
+    return;
+  }
+
+  const eventType = String(payload?.eventType || '').trim().toLowerCase();
+  const requestId = String(payload?.requestId || '').trim();
+  const dedupeKey = requestId || `${eventType || 'unknown'}:${eventId}:${String(payload?.requestedAt || '')}`;
+
+  prunePromotionEmailBlastSentCache();
+  if (sentPromotionEmailBlastRequests.has(dedupeKey)) {
+    logger.info('Skipping duplicate promotion email blast request', { dedupeKey, eventId, eventType });
+    return;
+  }
+
+  const systemRequester = {
+    authId: 'email-service',
+    id: 'email-service',
+    email: process.env.FROM_EMAIL || 'noreply@okkazo.com',
+    name: 'email-service',
+    role: 'MANAGER',
+  };
+
+  let eventTitle = String(payload?.eventTitle || '').trim() || 'Event';
+  let eventDescription = String(payload?.eventDescription || '').trim() || '';
+  let eventLocation = String(payload?.eventLocation || '').trim() || 'TBA';
+  let eventDate = payload?.eventDate || null;
+  let eventBannerUrl = String(payload?.eventBannerUrl || '').trim() || null;
+
+  try {
+    if (eventType === 'planning') {
+      const planning = await fetchPlanningByEventIdForUser(eventId, systemRequester);
+      if (planning) {
+        eventTitle = planning?.eventTitle || eventTitle;
+        eventDescription = planning?.eventDescription || eventDescription;
+        eventLocation = planning?.location?.name || planning?.location || eventLocation;
+        eventDate = planning?.schedule?.startAt || planning?.eventDate || eventDate;
+        eventBannerUrl = planning?.eventBanner?.url || planning?.eventBanner || eventBannerUrl;
+      }
+    } else if (eventType === 'promote') {
+      const promote = await fetchPromoteByEventIdForUser(eventId, systemRequester);
+      if (promote) {
+        eventTitle = promote?.eventTitle || eventTitle;
+        eventDescription = promote?.eventDescription || eventDescription;
+        eventLocation = promote?.venue?.locationName || eventLocation;
+        eventDate = promote?.schedule?.startAt || eventDate;
+        eventBannerUrl = promote?.eventBanner?.url || promote?.eventBanner || eventBannerUrl;
+      }
+    }
+  } catch (error) {
+    logger.warn('Failed to hydrate event details for promotion email blast', {
+      eventId,
+      eventType,
+      message: error?.message || String(error),
+    });
+  }
+
+  const allUsers = await fetchUsersByRole({ role: 'USER', pageSize: 100 });
+
+  const seenEmails = new Set();
+  const recipients = [];
+  for (const row of allUsers) {
+    if (row?.isActive === false) continue;
+
+    const email = String(row?.email || '').trim();
+    if (!email) continue;
+
+    const emailKey = email.toLowerCase();
+    if (seenEmails.has(emailKey)) continue;
+    seenEmails.add(emailKey);
+
+    recipients.push({
+      email,
+      name: String(row?.name || row?.fullName || row?.username || '').trim() || 'there',
+    });
+  }
+
+  if (recipients.length === 0) {
+    logger.warn('No USER recipients found for promotion email blast', { eventId, eventType, dedupeKey });
+    sentPromotionEmailBlastRequests.set(dedupeKey, Date.now());
+    return;
+  }
+
+  const frontendBaseUrl = String(process.env.FRONTEND_URL || '').replace(/\/$/, '');
+  const eventUrl = frontendBaseUrl
+    ? `${frontendBaseUrl}/user/event/${encodeURIComponent(eventId)}`
+    : null;
+
+  const batchSize = Math.max(1, Number(process.env.PROMOTION_EMAIL_BLAST_BATCH_SIZE || 25));
+  let sentCount = 0;
+  let failedCount = 0;
+
+  for (let idx = 0; idx < recipients.length; idx += batchSize) {
+    const chunk = recipients.slice(idx, idx + batchSize);
+    const chunkResult = await Promise.allSettled(
+      chunk.map((recipient) => emailService.sendPromotionEmailBlastEmail(recipient.email, {
+        recipientName: recipient.name,
+        eventId,
+        eventTitle,
+        eventDescription,
+        eventLocation,
+        eventDate,
+        eventUrl,
+        eventBannerUrl,
+      }))
+    );
+
+    for (const result of chunkResult) {
+      if (result.status === 'fulfilled') sentCount += 1;
+      else failedCount += 1;
+    }
+  }
+
+  sentPromotionEmailBlastRequests.set(dedupeKey, Date.now());
+  logger.info('Promotion email blast completed', {
+    eventId,
+    eventType,
+    dedupeKey,
+    recipients: recipients.length,
+    sentCount,
+    failedCount,
+  });
+};
+
 const handleEvent = async (eventType, payload, topic) => {
   if (!eventType) {
     logger.warn('Received Kafka event without type', { topic });
@@ -685,6 +1220,16 @@ const handleEvent = async (eventType, payload, topic) => {
         await handlePaymentSuccessEvent(payload);
       }
       break;
+    case 'USER_REVENUE_PAYOUT_SUCCESS':
+      if (topic === paymentTopic || topic === eventTopic) {
+        await handleUserRevenuePayoutSuccessEvent(payload);
+      }
+      break;
+    case 'PROMOTION_EMAIL_BLAST_REQUESTED':
+      if (topic === eventTopic) {
+        await handlePromotionEmailBlastRequested(payload);
+      }
+      break;
     case 'VENDOR_REQUEST_REJECTED_ALTERNATIVES':
       if (topic === eventTopic) {
         await handleVendorRequestRejectedAlternatives(payload);
@@ -693,6 +1238,11 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'PLANNING_QUOTE_LOCKED':
       if (topic === eventTopic) {
         await handlePlanningQuoteLocked(payload);
+      }
+      break;
+    case 'PLANNING_REMAINING_PAYMENT_CONFIRMED':
+      if (topic === eventTopic) {
+        await handlePlanningRemainingPaymentConfirmed(payload);
       }
       break;
     // Payment events that are useful for audit/analytics but do not trigger emails here

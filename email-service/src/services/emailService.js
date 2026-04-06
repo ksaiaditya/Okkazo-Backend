@@ -358,6 +358,132 @@ const sendPaymentSuccessEmail = async (email, details) => {
 };
 
 /**
+ * Send generated revenue payout received email to user.
+ */
+const sendUserGeneratedRevenueReceivedEmail = async (email, details) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventLocation,
+      payoutAmountPaise,
+      amount,
+      currency,
+      paidAt,
+      payoutMode,
+      transactionRef,
+    } = details || {};
+
+    if (!eventId) {
+      throw new Error('eventId is required');
+    }
+
+    const amountPaiseRaw = Number(
+      payoutAmountPaise !== undefined && payoutAmountPaise !== null
+        ? payoutAmountPaise
+        : amount
+    );
+    const normalizedAmountPaise = Number.isFinite(amountPaiseRaw) && amountPaiseRaw > 0
+      ? Math.round(amountPaiseRaw)
+      : 0;
+
+    if (normalizedAmountPaise <= 0) {
+      throw new Error('payout amount must be greater than zero');
+    }
+
+    const template = await loadTemplate('user-generated-revenue-received');
+    const normalizedCurrency = String(currency || 'INR').trim().toUpperCase() || 'INR';
+    const currencySymbol = normalizedCurrency === 'INR' ? '₹' : '';
+    const amountInCurrency = normalizedAmountPaise / 100;
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle: eventTitle || 'Event',
+      eventLocation: eventLocation || 'TBA',
+      amountRupees: amountInCurrency.toLocaleString('en-IN', { maximumFractionDigits: 2 }),
+      currency: normalizedCurrency,
+      currencySymbol,
+      paidAt: paidAt || null,
+      payoutMode: String(payoutMode || '').trim().toUpperCase() || 'DEMO',
+      transactionRef: transactionRef || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Revenue Payout Received - ${eventTitle || eventId}`, html);
+
+    logger.info('User generated revenue payout email sent', {
+      email,
+      eventId,
+      payoutMode,
+      transactionRef,
+    });
+  } catch (error) {
+    logger.error('Error sending generated revenue payout email:', error);
+    throw error;
+  }
+};
+
+/**
+ * Send promotion email blast for an event to platform users.
+ */
+const sendPromotionEmailBlastEmail = async (email, details) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDescription,
+      eventLocation,
+      eventDate,
+      eventUrl,
+      eventBannerUrl,
+    } = details || {};
+
+    if (!eventId) {
+      throw new Error('eventId is required');
+    }
+
+    const template = await loadTemplate('promotion-email-blast');
+    const trimmedDescription = String(eventDescription || '').trim();
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle: eventTitle || 'Event',
+      eventDescription: trimmedDescription || null,
+      eventLocation: eventLocation || 'TBA',
+      eventDate: eventDate || null,
+      eventUrl: eventUrl || null,
+      eventBannerUrl: eventBannerUrl || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Event Update: ${eventTitle || eventId}`, html);
+
+    logger.info('Promotion email blast sent', {
+      email,
+      eventId,
+      eventTitle,
+    });
+  } catch (error) {
+    logger.error('Error sending promotion email blast:', error);
+    throw error;
+  }
+};
+
+/**
  * Send email to client when a vendor rejects and alternatives are available.
  */
 const sendVendorRejectedAlternativesEmail = async (email, details) => {
@@ -494,6 +620,59 @@ const sendPlanningQuoteLockedVendorEmail = async (email, details) => {
   }
 };
 
+/**
+ * Send final settlement thank-you email after remaining payment success.
+ */
+const sendPlanningFinalSettlementThankYouEmail = async (email, details) => {
+  try {
+    if (!email) throw new Error('Email is required');
+
+    const {
+      recipientName,
+      eventId,
+      eventTitle,
+      eventDate,
+      eventLocation,
+      items,
+      promotions,
+      totalAmount,
+      depositPaid,
+      vendorConfirmationPaid,
+      remainingPaid,
+      totalPaid,
+      feedbackUrl,
+    } = details || {};
+
+    if (!eventId) throw new Error('eventId is required');
+    if (!eventTitle) throw new Error('eventTitle is required');
+
+    const template = await loadTemplate('planning-final-settlement-thankyou');
+    const html = template({
+      recipientName: recipientName || 'there',
+      eventId,
+      eventTitle,
+      eventDate: eventDate || null,
+      eventLocation: eventLocation || null,
+      items: Array.isArray(items) ? items : [],
+      promotions: Array.isArray(promotions) ? promotions : [],
+      totalAmount: totalAmount || null,
+      depositPaid: depositPaid || null,
+      vendorConfirmationPaid: vendorConfirmationPaid || null,
+      remainingPaid: remainingPaid || null,
+      totalPaid: totalPaid || null,
+      feedbackUrl: feedbackUrl || null,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+    });
+
+    await sendEmail(email, `Thank you for choosing Okkazo - ${eventTitle}`, html);
+    logger.info('Planning final settlement thank-you email sent', { email, eventId });
+  } catch (error) {
+    logger.error('Error sending planning final settlement thank-you email:', error);
+    throw error;
+  }
+};
+
 module.exports = {
   initialize,
   loadTemplate,
@@ -505,7 +684,10 @@ module.exports = {
   sendVendorAccountCreatedEmail,
   sendManagerAccountCreatedEmail,
   sendPaymentSuccessEmail,
+  sendUserGeneratedRevenueReceivedEmail,
+  sendPromotionEmailBlastEmail,
   sendVendorRejectedAlternativesEmail,
   sendPlanningQuoteLockedUserEmail,
   sendPlanningQuoteLockedVendorEmail,
+  sendPlanningFinalSettlementThankYouEmail,
 };
