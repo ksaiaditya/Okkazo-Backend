@@ -424,6 +424,38 @@ const handleEventEvent = async (payload) => {
     return;
   }
 
+  if (eventType === 'TICKET_CANCELLED_BY_USER') {
+    const authId = String(payload?.authId || '').trim();
+    if (!authId) return;
+
+    const eventTitle = String(payload?.eventTitle || 'your event').trim() || 'your event';
+    const selectedDay = String(payload?.selectedDay || '').trim();
+    const refundAmountInInr = Number(payload?.refundAmountInInr || 0);
+    const refundText = Number.isFinite(refundAmountInInr) && refundAmountInInr > 0
+      ? ` Refund of ₹${refundAmountInInr.toFixed(2)} has been initiated.`
+      : ' No refund is applicable as per the cancellation timeline.';
+
+    await createNotificationSafe({
+      recipientAuthId: authId,
+      recipientRole: 'USER',
+      type: 'TICKET_CANCELLED',
+      category: 'TICKET',
+      title: 'Ticket cancelled',
+      message: `Your ticket for ${eventTitle}${selectedDay ? ` (${selectedDay})` : ''} has been cancelled.${refundText}`,
+      actionUrl: '/user/my-events',
+      metadata: {
+        eventId: payload?.eventId,
+        ticketId: payload?.ticketId,
+        selectedDay: selectedDay || null,
+        cancelledAt: payload?.cancelledAt || null,
+        refundAmountInInr: Number.isFinite(refundAmountInInr) ? Number(refundAmountInInr.toFixed(2)) : 0,
+      },
+      dedupeKey: `TICKET_CANCELLED:${payload?.eventId || 'na'}:${payload?.ticketId || 'na'}:${authId}`,
+    });
+
+    return;
+  }
+
   if (eventType === 'EVENT_LIFECYCLE_STATUS_UPDATED') {
     await notifyLifecycleStakeholders({
       eventId: payload?.eventId,
