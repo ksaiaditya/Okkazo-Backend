@@ -121,6 +121,7 @@ const vendorPayoutReleaseSchema = Joi.object({
   eventId: Joi.string().trim().required(),
   vendorAuthId: Joi.string().trim().required(),
   service: Joi.string().trim().optional(),
+  overrideAmountPaise: Joi.number().integer().min(1).optional(),
 });
 
 const userRevenuePayoutReleaseSchema = Joi.object({
@@ -2848,7 +2849,11 @@ const releaseVendorPayout = async (payload, user) => {
   const commissionInr = Number(slot?.commissionAmount || 0);
   const lockedAmountPaise = Math.max(0, Math.round(quotedInr * 100));
   const commissionAmountPaise = Math.max(0, Math.round(commissionInr * 100));
-  const payoutAmountPaise = Math.max(0, lockedAmountPaise - commissionAmountPaise);
+  let payoutAmountPaise = Math.max(0, lockedAmountPaise - commissionAmountPaise);
+
+  if (value.overrideAmountPaise && Number.isFinite(value.overrideAmountPaise)) {
+    payoutAmountPaise = value.overrideAmountPaise;
+  }
 
   if (!Number.isFinite(payoutAmountPaise) || payoutAmountPaise <= 0) {
     throw createApiError(409, 'Vendor payout amount is zero for this service');

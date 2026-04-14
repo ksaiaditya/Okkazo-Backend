@@ -634,6 +634,7 @@ const handlePlanningCancellationPostActions = async ({
         eventId: normalizedEventId,
         authId: ownerAuthId,
         force: true,
+        preserveSelection: true,
       });
     } catch (error) {
       vendorRelease = {
@@ -2030,7 +2031,12 @@ const createPlanningRefundRequest = async ({ eventId, authId, cancellationReason
   }
 
   const lifecycleStatus = String(planning.status || '').trim();
-  if (TERMINAL_STATUSES.includes(lifecycleStatus) || lifecycleStatus === STATUS.REJECTED) {
+  if (
+    lifecycleStatus === STATUS.REJECTED ||
+    lifecycleStatus === STATUS.COMPLETED ||
+    lifecycleStatus === STATUS.VENDOR_PAYMENT_PENDING ||
+    lifecycleStatus === STATUS.CLOSED
+  ) {
     throw createApiError(409, 'Refund request cannot be raised for this planning status');
   }
 

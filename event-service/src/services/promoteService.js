@@ -2383,7 +2383,7 @@ const createPromoteRefundRequest = async ({
   }
 
   const lifecycleStatus = String(promote.eventStatus || '').trim().toUpperCase();
-  if (lifecycleStatus === PROMOTE_STATUS.COMPLETE || lifecycleStatus === PROMOTE_STATUS.CANCELLED || lifecycleStatus === PROMOTE_STATUS.CLOSED) {
+  if (lifecycleStatus === PROMOTE_STATUS.COMPLETE || lifecycleStatus === PROMOTE_STATUS.CLOSED || lifecycleStatus === PROMOTE_STATUS.REJECTED) {
     throw createApiError(409, 'Refund request cannot be raised for this promote status');
   }
 

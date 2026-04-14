@@ -13,7 +13,6 @@ const STICKY_PLANNING_STATUSES = new Set([
   STATUS.CONFIRMED,
   STATUS.COMPLETED,
   STATUS.VENDOR_PAYMENT_PENDING,
-  STATUS.CLOSED,
 ]);
 const REMOVAL_FREEZE_HOURS = 72;
 const PRICING_UNIT_VALUES = new Set(['EVENT', 'PER_PERSON', 'PER_PLATE', 'PER_KG', 'PER_100_UNITS', 'FIXED']);
@@ -1249,7 +1248,13 @@ const submitVendorConsentForServiceChangeRequest = async ({
   return { request: request.toObject ? request.toObject() : request, applied: true };
 };
 
-const releaseReservationsForPlanning = async ({ eventId, authId, service = null, force = false }) => {
+const releaseReservationsForPlanning = async ({
+  eventId,
+  authId,
+  service = null,
+  force = false,
+  preserveSelection = false,
+}) => {
   if (!eventId?.trim()) throw createApiError(400, 'Event ID is required');
   if (!authId?.trim()) throw createApiError(400, 'Auth ID is required');
 
@@ -1348,7 +1353,7 @@ const releaseReservationsForPlanning = async ({ eventId, authId, service = null,
   );
 
   let selectionCleared = 0;
-  if (candidateKeys.size > 0) {
+  if (!preserveSelection && candidateKeys.size > 0) {
     const currentVendors = Array.isArray(selection?.vendors)
       ? selection.vendors.map((v) => (v?.toObject ? v.toObject() : v))
       : [];
@@ -1391,6 +1396,7 @@ const releaseReservationsForPlanning = async ({ eventId, authId, service = null,
     released,
     candidates: candidates.length,
     selectionCleared,
+    preserveSelection: Boolean(preserveSelection),
     skipped: false,
     days: planningDays,
     service: targetService,

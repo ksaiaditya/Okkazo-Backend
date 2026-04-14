@@ -16,7 +16,6 @@ const STICKY_PLANNING_STATUSES = new Set([
   STATUS.CONFIRMED,
   STATUS.COMPLETED,
   STATUS.VENDOR_PAYMENT_PENDING,
-  STATUS.CLOSED,
 ]);
 const VENUE_SERVICE_LABEL = 'Venue';
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -207,6 +206,12 @@ const listFallbackSelectionLocksForDay = async ({ day, excludeEventId }) => {
   for (const eventId of eventIds) {
     const planning = planningByEventId.get(eventId);
     if (!planning) continue;
+
+    const planningStatus = String(planning?.status || '').trim().toUpperCase();
+    if (planningStatus === 'CANCELLED' || planningStatus === 'CANCELED' || planningStatus === 'CLOSED') {
+      // Cancelled/closed events must not keep vendors blocked for new selections.
+      continue;
+    }
 
     const stickyPlanning = isStickyPlanningPolicy(planning);
     const selection = selectionByEventId.get(eventId);
