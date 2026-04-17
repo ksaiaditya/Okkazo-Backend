@@ -1533,6 +1533,9 @@ const handleEvent = async (eventType, payload, topic) => {
     case 'PASSWORD_RESET_REQUESTED':
       await handlePasswordResetRequested(payload);
       break;
+    case 'PASSWORD_CHANGED':
+      await handlePasswordChanged(payload);
+      break;
     case 'EMAIL_VERIFICATION_RESEND':
       await handleEmailVerificationResend(payload);
       break;
@@ -1686,6 +1689,34 @@ const handlePasswordResetRequested = async (event) => {
     logger.info('Password reset email sent successfully', { authId, email });
   } catch (error) {
     logger.error('Error handling PASSWORD_RESET_REQUESTED event:', error);
+    throw error;
+  }
+};
+
+const handlePasswordChanged = async (event) => {
+  try {
+    const { authId, email, username, changedAt } = event;
+
+    if (!authId || !email) {
+      logger.error('PASSWORD_CHANGED event missing required fields', { event });
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      logger.error('PASSWORD_CHANGED event has invalid email format', { email });
+      return;
+    }
+
+    logger.info('Processing PASSWORD_CHANGED event', { authId, email });
+    await emailService.sendPasswordChangedEmail(email, {
+      recipientName: username || 'there',
+      changedAt: changedAt || null,
+      authId,
+    });
+    logger.info('Password changed confirmation email sent successfully', { authId, email });
+  } catch (error) {
+    logger.error('Error handling PASSWORD_CHANGED event:', error);
     throw error;
   }
 };

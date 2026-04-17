@@ -43,6 +43,17 @@ spring:
                     roles: ADMIN,MANAGER
 
             # Auth Service Routes (Public - No Authentication Required)
+            - id: auth-service-secured-change-password
+              uri: lb://auth-service
+              predicates:
+                - Path=/auth/change-password
+              filters:
+                - RewritePath=/auth/(?<segment>.*), /${segment}
+                - name: AuthenticationFilter
+                - name: RoleAuthorizationFilter
+                  args:
+                    roles: USER,VENDOR,ADMIN,MANAGER
+
             - id: auth-service-public
               uri: lb://auth-service
               predicates:

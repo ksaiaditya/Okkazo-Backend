@@ -6,6 +6,7 @@ import com.okkazo.authservice.dtos.UserLoginEvent;
 import com.okkazo.authservice.dtos.UserRegistrationEvent;
 import com.okkazo.authservice.dtos.UserGoogleRegisteredEvent;
 import com.okkazo.authservice.dtos.UserRoleChangedEvent;
+import com.okkazo.authservice.dtos.UserPasswordChangedEvent;
 import com.okkazo.authservice.dtos.ManagerAccountCreatedEvent;
 import com.okkazo.authservice.dtos.VendorAccountCreatedEvent;
 import com.okkazo.authservice.dtos.VendorRegistrationEvent;
@@ -72,6 +73,17 @@ public class AuthEventProducer {
                 authId,
                 email,
                 username
+        );
+        kafkaTemplate.send(topicName, authId.toString(), event);
+    }
+
+    public void passwordChanged(UUID authId, String email, String username, LocalDateTime changedAt) {
+        UserPasswordChangedEvent event = new UserPasswordChangedEvent(
+                "PASSWORD_CHANGED",
+                authId,
+                email,
+                username,
+                changedAt == null ? LocalDateTime.now() : changedAt
         );
         kafkaTemplate.send(topicName, authId.toString(), event);
     }

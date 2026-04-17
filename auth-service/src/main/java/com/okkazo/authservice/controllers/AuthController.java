@@ -8,6 +8,7 @@ import com.okkazo.authservice.services.PasswordResetService;
 import com.okkazo.authservice.services.RefreshTokenService;
 import com.okkazo.authservice.services.VendorPhoneOtpService;
 import com.okkazo.authservice.services.VendorRegistrationService;
+import com.okkazo.authservice.utils.JwtUtil;
 import com.okkazo.authservice.validators.VendorRegistrationValidator;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -19,6 +20,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 @RestController
@@ -32,6 +34,7 @@ public class AuthController {
     private final VendorRegistrationService vendorRegistrationService;
     private final VendorPhoneOtpService vendorPhoneOtpService;
     private final VendorRegistrationValidator vendorRegistrationValidator;
+    private final JwtUtil jwtUtil;
 
     @PostMapping("/register")
     public ResponseEntity<RegisterResponseDto> register(@Valid @RequestBody RegisterRequestDto registerDto){
@@ -79,6 +82,35 @@ public class AuthController {
     public ResponseEntity<ResetPasswordResponseDto> resetPassword(
             @Valid @RequestBody ResetPasswordRequestDto requestDto){
         return ResponseEntity.ok(passwordResetService.resetPassword(requestDto));
+    }
+
+    @PostMapping("/change-password")
+    public ResponseEntity<ChangePasswordResponseDto> changePassword(
+            @RequestHeader(value = "X-Auth-Id", required = false) String authId,
+            @RequestHeader(value = "Authorization", required = false) String authorization,
+            @Valid @RequestBody ChangePasswordRequestDto requestDto) {
+        UUID parsedAuthId = resolveAuthId(authId, authorization);
+
+        return ResponseEntity.ok(authService.changePassword(parsedAuthId, requestDto));
+    }
+
+    private UUID resolveAuthId(String xAuthId, String authorization) {
+        if (xAuthId != null && !xAuthId.isBlank()) {
+            try {
+                return UUID.fromString(xAuthId.trim());
+            } catch (IllegalArgumentException ex) {
+                throw new IllegalArgumentException("Invalid X-Auth-Id header");
+            }
+        }
+
+        if (authorization != null && authorization.startsWith("Bearer ")) {
+            String token = authorization.substring(7).trim();
+            if (!token.isBlank() && jwtUtil.validateToken(token)) {
+                return jwtUtil.extractUserId(token);
+            }
+        }
+
+        throw new IllegalArgumentException("Authentication context is required");
     }
     
     /**

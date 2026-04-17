@@ -1,6 +1,8 @@
 package com.okkazo.authservice.services;
 
 import com.okkazo.authservice.dtos.CheckEmailExistsResponseDto;
+import com.okkazo.authservice.dtos.ChangePasswordRequestDto;
+import com.okkazo.authservice.dtos.ChangePasswordResponseDto;
 import com.okkazo.authservice.dtos.GoogleLoginRequestDto;
 import com.okkazo.authservice.dtos.LoginRequestDto;
 import com.okkazo.authservice.dtos.LoginResponseDto;
@@ -18,6 +20,7 @@ import com.okkazo.authservice.models.Role;
 import com.okkazo.authservice.models.Status;
 import com.okkazo.authservice.repositories.AuthRepository;
 import com.okkazo.authservice.repositories.EmailVerificationTokenRepository;
+import com.okkazo.authservice.utils.PasswordPolicy;
 import com.okkazo.authservice.utils.JwtUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -308,6 +311,61 @@ public class AuthService {
 
         private String normalizeEmail(String email) {
                 return email == null ? "" : email.trim().toLowerCase();
+        }
+
+        @Transactional
+        public ChangePasswordResponseDto changePassword(UUID authId, ChangePasswordRequestDto requestDto) {
+                if (authId == null) {
+                        throw new InvalidTokenException("Authentication context is missing");
+                }
+
+                Auth user = repository.findById(authId)
+                                .orElseThrow(() -> new UserNotFoundException("User not found"));
+
+                if (user.getStatus() == Status.BLOCKED) {
+                        throw new AccountBlockedException("Your account has been blocked. Please contact support.");
+                }
+
+                if (user.getAuthProvider() == AuthProvider.SIGN_IN_WITH_GOOGLE) {
+                        throw new IllegalArgumentException("Password change is not available for Google-only accounts");
+                }
+
+                String currentPassword = requestDto.currentPassword();
+                String newPassword = requestDto.newPassword();
+                String confirmPassword = requestDto.confirmPassword();
+
+                if (!passwordEncoder.matches(currentPassword, user.getHashedPassword())) {
+                        throw new InvalidCredentialsException("Current password is incorrect");
+                }
+
+                if (!PasswordPolicy.isStrong(newPassword)) {
+                        throw new IllegalArgumentException(PasswordPolicy.MESSAGE);
+                }
+
+                if (!newPassword.equals(confirmPassword)) {
+                        throw new IllegalArgumentException("New password and confirm password do not match");
+                }
+
+                if (passwordEncoder.matches(newPassword, user.getHashedPassword())) {
+                        throw new IllegalArgumentException("New password must be different from current password");
+                }
+
+                user.setHashedPassword(passwordEncoder.encode(newPassword));
+                repository.save(user);
+
+                authEvent.passwordChanged(
+                                user.getAuthId(),
+                                user.getEmail(),
+                                user.getUsername(),
+                                LocalDateTime.now()
+                );
+
+                log.info("Password changed successfully for user: {}", user.getEmail());
+
+                return new ChangePasswordResponseDto(
+                                "Password changed successfully",
+                                true
+                );
         }
 
     @Transactional

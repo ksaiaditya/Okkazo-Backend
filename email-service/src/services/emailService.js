@@ -160,6 +160,52 @@ const sendPasswordResetEmail = async (email, resetToken, authId) => {
 };
 
 /**
+ * Send confirmation email after a successful password change.
+ */
+const sendPasswordChangedEmail = async (email, details = {}) => {
+  try {
+    if (!email) {
+      throw new Error('Email is required');
+    }
+
+    const {
+      recipientName,
+      changedAt,
+      authId,
+    } = details;
+
+    const template = await loadTemplate('password-changed');
+
+    const changedDate = changedAt ? new Date(changedAt) : new Date();
+    const changedAtLabel = Number.isNaN(changedDate.getTime())
+      ? new Date().toLocaleString('en-IN')
+      : changedDate.toLocaleString('en-IN', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true,
+      });
+
+    const html = template({
+      recipientName: recipientName || 'there',
+      changedAt: changedAtLabel,
+      platformName: 'Okkazo',
+      supportEmail: process.env.FROM_EMAIL,
+      forgotPasswordUrl: process.env.FORGOT_PASSWORD_URL || process.env.FRONTEND_URL || null,
+    });
+
+    await sendEmail(email, 'Your Okkazo Password Was Changed', html);
+
+    logger.info('Password changed confirmation email sent', { email, authId });
+  } catch (error) {
+    logger.error('Error sending password changed email:', error);
+    throw error;
+  }
+};
+
+/**
  * Send welcome email
  */
 const sendWelcomeEmail = async (email, username) => {
@@ -944,6 +990,7 @@ module.exports = {
   sendEmail,
   sendVerificationEmail,
   sendPasswordResetEmail,
+  sendPasswordChangedEmail,
   sendWelcomeEmail,
   sendTestEmail,
   sendVendorAccountCreatedEmail,
