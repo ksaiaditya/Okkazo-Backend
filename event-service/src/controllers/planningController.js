@@ -1,6 +1,7 @@
 const planningService = require('../services/planningService');
 const planningQuoteService = require('../services/planningQuoteService');
 const promoteConfigService = require('../services/promoteConfigService');
+const Planning = require('../models/Planning');
 const VendorSelection = require('../models/VendorSelection');
 const { resolveUserServiceIdFromAuthId, fetchUserById } = require('../services/userServiceClient');
 const bannerUploadService = require('../services/bannerUploadService');
@@ -266,6 +267,147 @@ const normalizeSortKey = (value) => {
   if (v.includes('price') && v.includes('low')) return 'priceLow';
   if (v.includes('price') && v.includes('high')) return 'priceHigh';
   return v;
+};
+
+const normalizeVendorAuthToken = (value) => String(value || '').trim().toLowerCase();
+
+const normalizeReviewServiceToken = (value) => String(value || '')
+  .trim()
+  .toLowerCase()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ');
+
+const buildVendorFeedbackAggregateMap = async ({ vendorAuthIds, serviceCategory, maxReviewsPerVendor = 120 } = {}) => {
+  const normalizedVendorAuthIds = Array.from(
+    new Set(
+      (Array.isArray(vendorAuthIds) ? vendorAuthIds : [])
+        .map((value) => normalizeVendorAuthToken(value))
+        .filter(Boolean)
+    )
+  );
+  const normalizedServiceCategory = normalizeReviewServiceToken(serviceCategory);
+
+  if (!normalizedServiceCategory || normalizedVendorAuthIds.length === 0) {
+    return new Map();
+  }
+
+  const rows = await Planning.aggregate([
+    {
+      $match: {
+        'feedback.vendors.0': { $exists: true },
+      },
+    },
+    {
+      $project: {
+        eventId: 1,
+        vendorFeedbackRows: '$feedback.vendors',
+      },
+    },
+    {
+      $unwind: '$vendorFeedbackRows',
+    },
+    {
+      $project: {
+        eventId: 1,
+        vendorAuthKey: {
+          $toLower: {
+            $trim: {
+              input: { $ifNull: ['$vendorFeedbackRows.vendorAuthId', ''] },
+            },
+          },
+        },
+        serviceKey: {
+          $toLower: {
+            $trim: {
+              input: { $ifNull: ['$vendorFeedbackRows.service', ''] },
+            },
+          },
+        },
+        rating: '$vendorFeedbackRows.rating',
+        review: { $ifNull: ['$vendorFeedbackRows.review', ''] },
+        submittedAt: '$vendorFeedbackRows.submittedAt',
+      },
+    },
+    {
+      $match: {
+        vendorAuthKey: { $in: normalizedVendorAuthIds },
+        serviceKey: normalizedServiceCategory,
+        rating: { $gte: 1, $lte: 5 },
+      },
+    },
+    {
+      $sort: {
+        submittedAt: -1,
+      },
+    },
+    {
+      $group: {
+        _id: '$vendorAuthKey',
+        averageRating: { $avg: '$rating' },
+        totalReviews: { $sum: 1 },
+        rating1Count: { $sum: { $cond: [{ $eq: ['$rating', 1] }, 1, 0] } },
+        rating2Count: { $sum: { $cond: [{ $eq: ['$rating', 2] }, 1, 0] } },
+        rating3Count: { $sum: { $cond: [{ $eq: ['$rating', 3] }, 1, 0] } },
+        rating4Count: { $sum: { $cond: [{ $eq: ['$rating', 4] }, 1, 0] } },
+        rating5Count: { $sum: { $cond: [{ $eq: ['$rating', 5] }, 1, 0] } },
+        reviews: {
+          $push: {
+            eventId: '$eventId',
+            rating: '$rating',
+            review: '$review',
+            submittedAt: '$submittedAt',
+          },
+        },
+      },
+    },
+  ]);
+
+  const summaryMap = new Map();
+  for (const row of rows) {
+    const vendorAuthKey = normalizeVendorAuthToken(row?._id);
+    if (!vendorAuthKey) continue;
+
+    const rawAverageRating = Number(row?.averageRating);
+    const averageRating = Number.isFinite(rawAverageRating)
+      ? Number(rawAverageRating.toFixed(1))
+      : 0;
+    const totalReviews = Math.max(0, Number(row?.totalReviews || 0));
+
+    const reviews = (Array.isArray(row?.reviews) ? row.reviews : [])
+      .slice(0, Math.max(1, Number(maxReviewsPerVendor || 120)))
+      .map((entry, index) => {
+        const rating = Number(entry?.rating);
+        const sanitizedReview = String(entry?.review || '').trim();
+        if (!Number.isFinite(rating) || rating <= 0 || !sanitizedReview) {
+          return null;
+        }
+
+        return {
+          id: `${vendorAuthKey}-${index + 1}`,
+          user: 'Client',
+          rating: Math.max(1, Math.min(5, Math.round(rating))),
+          review: sanitizedReview,
+          submittedAt: entry?.submittedAt || null,
+          eventId: String(entry?.eventId || '').trim() || null,
+        };
+      })
+      .filter(Boolean);
+
+    summaryMap.set(vendorAuthKey, {
+      averageRating,
+      totalReviews,
+      ratingsBreakdown: {
+        1: Number(row?.rating1Count || 0),
+        2: Number(row?.rating2Count || 0),
+        3: Number(row?.rating3Count || 0),
+        4: Number(row?.rating4Count || 0),
+        5: Number(row?.rating5Count || 0),
+      },
+      reviews,
+    });
+  }
+
+  return summaryMap;
 };
 
 const extractRating = (service) => {
@@ -1883,6 +2025,11 @@ const getVendorsForPlanning = async (req, res) => {
       new Set(serviceItems.map((s) => s.vendorAuthId).filter(Boolean))
     );
 
+    const vendorFeedbackAggregateByAuthId = await buildVendorFeedbackAggregateMap({
+      vendorAuthIds: authIds,
+      serviceCategory: normalizedServiceCategory,
+    });
+
     const vendorApps = await fetchPublicVendorsByAuthIds(authIds);
     const vendorAppByAuthId = new Map(vendorApps.map((v) => [v.authId, v]));
 
@@ -1898,6 +2045,7 @@ const getVendorsForPlanning = async (req, res) => {
           });
 
         const app = vendorAppByAuthId.get(authId) || null;
+        const feedbackAggregate = vendorFeedbackAggregateByAuthId.get(normalizeVendorAuthToken(authId)) || null;
 
         // Default: vendor HQ coordinates (from vendor app), with service fallback.
         // Venue special-case: distance should be computed from the venue service's own location.
@@ -1942,10 +2090,18 @@ const getVendorsForPlanning = async (req, res) => {
         const priceMin = pricesMin.length ? Math.min(...pricesMin) : null;
         const priceMax = pricesMax.length ? Math.max(...pricesMax) : null;
 
-        const rating = Math.max(
+        const fallbackRating = Math.max(
           0,
           ...services.map((s) => toNumber(s.rating, 0)).filter((n) => n != null)
         );
+        const rating = feedbackAggregate?.averageRating != null ? feedbackAggregate.averageRating : fallbackRating;
+        const reviewCount = Number(feedbackAggregate?.totalReviews || 0);
+        const reviewSummary = {
+          averageRating: rating,
+          totalReviews: reviewCount,
+          ratingsBreakdown: feedbackAggregate?.ratingsBreakdown || null,
+        };
+        const reviewEntries = Array.isArray(feedbackAggregate?.reviews) ? feedbackAggregate.reviews : [];
 
         const latestCreatedAt = services[0]?.createdAt || null;
 
@@ -1968,6 +2124,10 @@ const getVendorsForPlanning = async (req, res) => {
           description: app?.description || null,
           priceMin,
           priceMax,
+          reviews: reviewCount,
+          reviewCount,
+          reviewSummary,
+          reviewEntries,
           latestCreatedAt,
           services: services.map((s) => ({
             serviceId: s.serviceId,
@@ -1979,7 +2139,11 @@ const getVendorsForPlanning = async (req, res) => {
             tier: s.tier,
             description: s.description,
             details: s.details,
-            rating: s.rating,
+            rating: feedbackAggregate?.averageRating != null ? feedbackAggregate.averageRating : s.rating,
+            reviews: reviewCount,
+            reviewCount,
+            reviewSummary,
+            reviewEntries,
             createdAt: s.createdAt,
           })),
         };
